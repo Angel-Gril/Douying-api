@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+.douyin_cookies.json
+
+# Runtime output and downloaded media
+*.log
+downloads/
+.playwright-mcp/
+
+# Local/editor metadata
+.claude/
+.codex/
+.agents/
+.remote_review/
+_ref/
+.idea/
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db

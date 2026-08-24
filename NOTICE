@@ -1,0 +1,8 @@
+Douyin API
+
+This project includes adapted signing implementations in `abogus.py` and
+`xbogus.py`. Those files retain their upstream copyright and license notices;
+the applicable upstream terms continue to apply to those components.
+
+The remaining project code is distributed under the Apache License, Version
+2.0. See `LICENSE` and the headers of individual source files for details.

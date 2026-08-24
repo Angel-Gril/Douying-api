@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>短视频无水印解析</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: #0a0a1a;
+            color: #e0e0e0;
+            min-height: 100vh;
+        }
+        .container { max-width: 860px; margin: 0 auto; padding: 30px 20px; }
+        h1 {
+            text-align: center;
+            font-size: 1.6em;
+            margin-bottom: 6px;
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        .subtitle { text-align: center; color: #666; font-size: 0.85em; margin-bottom: 24px; }
+        .status-bar {
+            display: flex; justify-content: center; gap: 16px;
+            margin-bottom: 20px; font-size: 12px;
+        }
+        .status-item { display: flex; align-items: center; gap: 4px; }
+        .dot { width: 6px; height: 6px; border-radius: 50%; }
+        .dot-green { background: #4ade80; }
+        .dot-yellow { background: #fbbf24; }
+        .dot-red { background: #f87171; }
+        .input-row { display: flex; gap: 10px; margin-bottom: 16px; }
+        input[type="text"] {
+            flex: 1; padding: 13px 16px;
+            border: 1px solid #2a2a4a; border-radius: 8px;
+            background: #12122a; color: #fff; font-size: 14px; outline: none;
+            transition: border-color 0.2s;
+        }
+        input:focus { border-color: #667eea; }
+        .btn-parse {
+            padding: 13px 24px; border: none; border-radius: 8px;
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            color: #fff; font-size: 14px; font-weight: 600;
+            cursor: pointer; white-space: nowrap;
+            transition: opacity 0.2s, transform 0.1s;
+        }
+        .btn-parse:hover { opacity: 0.9; }
+        .btn-parse:active { transform: scale(0.97); }
+        .btn-parse:disabled { opacity: 0.4; cursor: not-allowed; }
+        .platforms {
+            display: flex; flex-wrap: wrap; gap: 6px;
+            justify-content: center; margin-bottom: 24px;
+        }
+        .tag {
+            padding: 4px 10px; border-radius: 12px;
+            background: #1a1a3a; border: 1px solid #2a2a4a;
+            font-size: 11px; color: #888;
+        }
+        .result { display: none; background: #12122a; border: 1px solid #2a2a4a; border-radius: 10px; padding: 20px; }
+        .result.show { display: block; }
+        .loading { text-align: center; padding: 30px; color: #888; }
+        .spinner {
+            display: inline-block; width: 24px; height: 24px;
+            border: 2px solid #333; border-top-color: #667eea;
+            border-radius: 50%; animation: spin 0.7s linear infinite;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<div class="container">
+    <h1>短视频无水印解析</h1>
+    <p class="subtitle">本地自建服务 - 多策略解析，不依赖单一API</p>
+
+    <div class="status-bar">
+        <span class="status-item"><span class="dot dot-green" id="dotServer"></span><span id="statusText">检测中...</span></span>
+        <span class="status-item"><span class="dot" id="dotCookie"></span><span id="cookieText">Cookie: -</span></span>
+    </div>
+
+    <div class="platforms">
+        <span class="tag">抖音</span><span class="tag">豆包</span>
+        <span class="tag">快手</span><span class="tag">小红书</span>
+        <span class="tag">B站</span><span class="tag">微博</span>
+        <span class="tag">头条</span><span class="tag">皮皮虾</span>
+    </div>
+
+    <div class="input-row">
+        <input type="text" id="urlInput" placeholder="粘贴分享链接或口令，如: https://v.douyin.com/xxx">
+        <button class="btn-parse" id="parseBtn" onclick="parse()">解析</button>
+    </div>
+
+    <div class="result" id="resultBox"></div>
+
+    <!-- 技术说明 -->
+    <details style="margin-top:24px;color:#555;font-size:12px;">
+        <summary style="cursor:pointer;margin-bottom:8px;">技术架构说明</summary>
+        <div style="background:#12122a;padding:14px;border-radius:8px;line-height:1.8;">
+            <b>解析策略优先级:</b><br>
+            1. 自建解析 - 直接调用平台内部API (需配置Cookie)<br>
+            2. HTML提取 - 从页面SSR数据中提取视频信息<br>
+            3. 公开API - 调用第三方解析服务作为兜底<br><br>
+            <b>抖音签名算法:</b><br>
+            - X-Bogus: MD5(URL参数+UA) → RC4加密 → 自定义Base64<br>
+            - a_bogus: SM3哈希 + RC4 + 浏览器指纹 (由bdms SDK生成)<br><br>
+            <b>无水印提取方法:</b><br>
+            - download_addr字段 (官方下载地址)<br>
+            - play_addr中 playwm→play 替换<br>
+            - 用video_id构造: aweme.snssdk.com/aweme/v1/play/?video_id={uri}<br><br>
+            <b>配置Cookie提升成功率:</b><br>
+            使用 setup_cookie.py 保存 Cookie，或在启动环境中设置 DOUYIN_COOKIE
+        </div>
+    </details>
+</div>
+
+<script>
+const API_BASE = location.origin;
+
+async function checkStatus() {
+    try {
+        const r = await fetch(`${API_BASE}/api/status`);
+        const d = await r.json();
+        document.getElementById('dotServer').className = 'dot dot-green';
+        document.getElementById('statusText').textContent = '服务运行中';
+        const hasCookie = d.cookie_configured;
+        document.getElementById('dotCookie').className = `dot ${hasCookie ? 'dot-green' : 'dot-yellow'}`;
+        document.getElementById('cookieText').textContent = hasCookie ? 'Cookie: 已配置' : 'Cookie: 未配置(成功率较低)';
+    } catch {
+        document.getElementById('dotServer').className = 'dot dot-red';
+        document.getElementById('statusText').textContent = '服务未启动';
+        document.getElementById('dotCookie').className = 'dot dot-red';
+        document.getElementById('cookieText').textContent = 'Cookie: -';
+    }
+}
+
+async function parse() {
+    const input = document.getElementById('urlInput').value.trim();
+    if (!input) return alert('请输入链接');
+
+    const box = document.getElementById('resultBox');
+    const btn = document.getElementById('parseBtn');
+    box.className = 'result show';
+    box.innerHTML = '<div class="loading"><div class="spinner"></div><p style="margin-top:10px">解析中...</p></div>';
+    btn.disabled = true;
+
+    try {
+        const r = await fetch(`${API_BASE}/api/parse?url=${encodeURIComponent(input)}`);
+        const d = await r.json();
+        if (d.code === 200 && d.data) {
+            box.innerHTML = renderResult(d);
+        } else {
+            box.innerHTML = `<div style="color:#f87171;text-align:center;padding:20px;">
+                <p style="font-size:14px;margin-bottom:8px;">${d.msg || '解析失败'}</p>
+                <p style="font-size:12px;color:#666;">${JSON.stringify(d.data || {})}</p>
+            </div>`;
+        }
+    } catch (e) {
+        box.innerHTML = `<div style="color:#f87171;text-align:center;padding:20px;">
+            请求失败: ${e.message}<br><small style="color:#666;">请确认服务已启动: python server.py</small>
+        </div>`;
+    } finally {
+        btn.disabled = false;
+    }
+}
+
+function renderResult(resp) {
+    const d = resp.data;
+    const platform = resp.platform || '';
+    const source = d.source || '未知';
+    const type = d.type || 'video';
+    const title = esc(d.title || d.desc || '');
+    const author = d.author?.name || d.author?.nickname || '';
+    const cover = d.cover || d.play_info?.poster_url || '';
+
+    let html = `<div style="display:flex;gap:14px;align-items:flex-start;">`;
+    if (cover) html += `<img src="${cover}" style="width:100px;height:140px;object-fit:cover;border-radius:6px;background:#222;" onerror="this.style.display='none'">`;
+    html += `<div style="flex:1;min-width:0;">
+        <div style="font-size:14px;font-weight:600;margin-bottom:6px;line-height:1.4;word-break:break-all;">${title || '无标题'}</div>
+        ${author ? `<div style="color:#888;font-size:12px;margin-bottom:4px;">@${esc(author)}</div>` : ''}
+        <div style="display:flex;gap:6px;flex-wrap:wrap;">
+            <span style="padding:2px 8px;border-radius:10px;background:#667eea22;color:#667eea;font-size:11px;">${type === 'image' ? '图集' : '视频'}</span>
+            <span style="padding:2px 8px;border-radius:10px;background:#4ade8022;color:#4ade80;font-size:11px;">${platform}</span>
+            <span style="padding:2px 8px;border-radius:10px;background:#fbbf2422;color:#fbbf24;font-size:11px;">来源: ${source}</span>
+        </div>
+    </div></div>`;
+
+    // 下载区
+    html += `<div style="margin-top:16px;padding-top:16px;border-top:1px solid #2a2a4a;">`;
+
+    if (type === 'video' || d.url || d.play_info) {
+        const mainUrl = d.url || d.play_info?.main || '';
+        const videoTitle = title || '视频';
+        html += `<div style="font-size:12px;color:#888;margin-bottom:8px;">视频下载 (无水印)</div>`;
+        if (mainUrl) html += dlItem(videoTitle, mainUrl);
+
+        // 多画质选项
+        if (d.video_backup?.length) {
+            const seen = new Set();
+            const unique = d.video_backup.filter(v => {
+                if (typeof v === 'string') return true;
+                const key = `${v.quality}_${v.codec}_${v.format}`;
+                if (seen.has(key)) return false;
+                seen.add(key); return true;
+            });
+            // 只显示mp4格式的前几个画质
+            const mp4s = unique.filter(v => typeof v === 'string' || v.format === 'mp4').slice(0, 5);
+            if (mp4s.length) {
+                html += `<div style="font-size:11px;color:#666;margin:8px 0 6px;">多画质 (MP4)</div>`;
+                mp4s.forEach(v => {
+                    if (typeof v === 'string') { html += dlItem('备用', v); return; }
+                    const label = `${v.quality} | ${v.codec} | ${(v.bit_rate/1000).toFixed(0)}kbps`;
+                    html += dlItem(label, v.url);
+                });
+            }
+        }
+        if (!mainUrl && !d.video_backup?.length) html += `<div style="color:#666;font-size:12px;">未找到视频直链</div>`;
+    }
+
+    if (type === 'image' && d.images?.length) {
+        html += `<div style="font-size:12px;color:#888;margin-bottom:8px;">图集 (${d.images.length}张)</div>`;
+        html += `<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:8px;">`;
+        d.images.forEach((img, i) => {
+            const src = typeof img === 'string' ? img : (img.url || img.url_list?.[0] || '');
+            html += `<a href="${src}" target="_blank" download><img src="${src}" style="width:100%;border-radius:4px;" loading="lazy"></a>`;
+        });
+        html += `</div>`;
+    }
+
+    if (d.music?.url) {
+        html += `<div style="font-size:12px;color:#888;margin:12px 0 8px;">背景音乐</div>`;
+        html += dlItem(d.music.title || '音乐', d.music.url, 'mp3');
+    }
+
+    html += `</div>`;
+
+    // 原始数据
+    html += `<details style="margin-top:14px;"><summary style="cursor:pointer;font-size:11px;color:#555;">原始数据</summary>
+        <pre style="margin-top:8px;padding:10px;background:#0a0a1a;border-radius:6px;font-size:10px;color:#666;overflow-x:auto;max-height:200px;">${esc(JSON.stringify(d, null, 2))}</pre>
+    </details>`;
+
+    return html;
+}
+
+function dlItem(label, url, ext) {
+    ext = ext || 'mp4';
+    const safeName = label.replace(/[^a-zA-Z0-9一-鿿._-]/g, '_');
+    const proxyUrl = API_BASE + '/api/download?url=' + encodeURIComponent(url) + '&filename=' + encodeURIComponent(safeName + '.' + ext);
+    return `<div style="display:flex;align-items:center;justify-content:space-between;padding:10px 12px;background:#0a0a1a;border-radius:6px;margin-bottom:6px;border:1px solid #1a1a3a;">
+        <span style="font-size:13px;color:#ccc;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:60%;">${label}</span>
+        <button data-url="${proxyUrl.replace(/"/g, '&quot;')}" onclick="startDownload(this)" style="padding:5px 14px;border:none;border-radius:5px;background:#667eea;color:#fff;font-size:12px;font-weight:500;cursor:pointer;">下载</button>
+    </div>`;
+}
+
+function startDownload(btn) {
+    const url = btn.getAttribute('data-url');
+    btn.textContent = '下载中...';
+    btn.style.opacity = '0.6';
+    btn.disabled = true;
+    const iframe = document.createElement('iframe');
+    iframe.style.display = 'none';
+    iframe.src = url;
+    document.body.appendChild(iframe);
+    setTimeout(() => {
+        btn.textContent = '下载';
+        btn.style.opacity = '1';
+        btn.disabled = false;
+        document.body.removeChild(iframe);
+    }, 5000);
+}
+
+function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+
+document.getElementById('urlInput').addEventListener('keydown', e => { if (e.key === 'Enter') parse(); });
+checkStatus();
+</script>
+</body>
+</html>
