@@ -7,6 +7,8 @@ import json
 import urllib.parse
 from typing import Optional
 
+from douyin_parser import parse_aweme_detail
+
 
 async def parse_douyin_by_browser(aweme_id: str) -> Optional[dict]:
     """
@@ -88,57 +90,6 @@ def _find_aweme_detail(obj, depth=0):
 
 
 def _format_result(detail: dict) -> dict:
-    video = detail.get("video", {})
-    author = detail.get("author", {})
-    images = detail.get("images") or []
-
-    if images:
-        image_urls = []
-        for img in images:
-            url_list = img.get("url_list", [])
-            if url_list:
-                image_urls.append(url_list[-1])
-        return {
-            "type": "image",
-            "title": detail.get("desc", ""),
-            "images": image_urls,
-            "cover": (video.get("cover", {}).get("url_list") or [""])[0],
-            "author": {
-                "name": author.get("nickname", ""),
-                "id": author.get("unique_id") or author.get("short_id", ""),
-            },
-            "source": "browser_intercept",
-        }
-
-    play_addr = video.get("play_addr", {})
-    download_addr = video.get("download_addr", {})
-
-    nwm_url = ""
-    if download_addr.get("url_list"):
-        nwm_url = download_addr["url_list"][0]
-    elif play_addr.get("url_list"):
-        nwm_url = play_addr["url_list"][0].replace("playwm", "play")
-    elif play_addr.get("uri"):
-        nwm_url = f"https://aweme.snssdk.com/aweme/v1/play/?video_id={play_addr['uri']}&ratio=1080p&line=0"
-
-    return {
-        "type": "video",
-        "title": detail.get("desc", ""),
-        "url": nwm_url,
-        "video_id": play_addr.get("uri", ""),
-        "cover": (video.get("cover", {}).get("url_list") or [""])[0],
-        "duration": video.get("duration", 0),
-        "width": play_addr.get("width", 0),
-        "height": play_addr.get("height", 0),
-        "author": {
-            "name": author.get("nickname", ""),
-            "id": author.get("unique_id") or author.get("short_id", ""),
-        },
-        "music": {
-            "title": detail.get("music", {}).get("title", ""),
-            "url": (detail.get("music", {}).get("play_url", {}).get("url_list") or [""])[0]
-            if isinstance(detail.get("music", {}).get("play_url"), dict)
-            else "",
-        },
-        "source": "browser_intercept",
-    }
+    result = parse_aweme_detail(detail)
+    result["source"] = "browser_intercept"
+    return result

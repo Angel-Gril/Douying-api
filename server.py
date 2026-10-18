@@ -4,6 +4,7 @@
 """
 
 import re
+import asyncio
 import json
 import ipaddress
 import os
@@ -27,6 +28,9 @@ except ImportError:
     BROWSER_AVAILABLE = False
 
 from platform_parsers import parse_xiaohongshu, parse_kuaishou
+from douyin_parser import (
+    build_original_video_url, extract_play_count, parse_aweme_detail, parse_iesdouyin_item,
+)
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
@@ -45,7 +49,7 @@ app.add_middleware(
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 MOBILE_UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
 
-# 抖音Cookie - 从浏览器获取后填入，没有也能用但成功率低
+# 抖音 Cookie 仅供签名策略使用；优先尝试免 Cookie 详情。
 DOUYIN_COOKIE = os.getenv("DOUYIN_COOKIE", "").strip()
 ENABLE_DEBUG_ENDPOINTS = os.getenv("ENABLE_DEBUG_ENDPOINTS", "0").lower() in {"1", "true", "yes"}
 
@@ -104,25 +108,93 @@ def generate_device_fingerprint() -> dict:
 
 # === 工具函数 ===
 
-async def resolve_video_redirect(url: str) -> Optional[str]:
-    """手动跟踪302重定向链，只读Location头不下载body"""
-    headers = {"User-Agent": USER_AGENT, "Referer": "https://www.douyin.com/"}
-    current = url
-    async with httpx.AsyncClient(follow_redirects=False, timeout=10) as client:
-        for _ in range(5):
-            try:
+async def probe_video_url(url: str) -> Optional[dict]:
+    """只用 HEAD 验证媒体和大小；每一跳检查公网地址，总耗时至多 8 秒。"""
+    if not url:
+        return None
+
+    async def probe():
+        headers = {"User-Agent": USER_AGENT, "Referer": "https://www.douyin.com/"}
+        current = url
+        async with httpx.AsyncClient(follow_redirects=False, timeout=5) as client:
+            for _ in range(5):
+                if not await asyncio.to_thread(_is_safe_download_url, current):
+                    return None
                 resp = await client.head(current, headers=headers)
                 if resp.status_code in (301, 302, 303, 307, 308):
-                    current = str(resp.headers.get("location", current))
-                    if not current.startswith("http"):
-                        break
-                else:
-                    break
-            except Exception:
-                break
-    if current != url:
-        return current
-    return None
+                    location = resp.headers.get("location")
+                    if not location:
+                        return None
+                    current = urllib.parse.urljoin(current, location)
+                    continue
+                content_type = resp.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+                if resp.status_code not in (200, 206) or not (
+                    content_type.startswith("video/") or content_type == "application/octet-stream"
+                ):
+                    return None
+                size = int(resp.headers.get("content-length", "0"))
+                if size < 0 or resp.headers.get("content-length") == "0":
+                    return None
+                return {"url": current, "data_size": size}
+        return None
+
+    try:
+        return await asyncio.wait_for(probe(), timeout=8)
+    except (httpx.HTTPError, asyncio.TimeoutError, ValueError):
+        return None
+
+
+async def resolve_video_redirect(url: str) -> Optional[str]:
+    media = await probe_video_url(url)
+    return media["url"] if media else None
+
+
+async def fetch_douyin_play_count(aweme_id: str) -> Optional[int]:
+    """精选移动页的尽力查询；不获取 Cookie，失败不阻断解析。"""
+    def fetch():
+        from curl_cffi.requests import Session
+
+        url = f"https://jingxuan.douyin.com/m/video/{aweme_id}?app=yumme"
+        headers = {
+            "User-Agent": MOBILE_UA,
+            "Origin": "https://open.douyin.com",
+            "Referer": "https://open.douyin.com/",
+        }
+        with Session(impersonate="chrome124") as session:
+            resp = session.get(url, headers=headers, timeout=8, allow_redirects=False)
+        return extract_play_count(resp.text, aweme_id) if resp.status_code == 200 else None
+
+    try:
+        return await asyncio.to_thread(fetch)
+    except Exception:
+        return None
+
+
+async def enrich_douyin_video(result: dict, aweme_id: str) -> bool:
+    """补充原画和播放量；只有未验证的构造入口时返回 False，继续后备策略。"""
+    if result.get("type") == "image":
+        return True
+    original_url = build_original_video_url(result.get("video_id"))
+    probe_url = original_url
+    if not probe_url:
+        host = urllib.parse.urlparse(result.get("url") or "").hostname or ""
+        if host == "snssdk.com" or host.endswith(".snssdk.com"):
+            probe_url = result["url"]
+    media, count = await asyncio.gather(
+        probe_video_url(probe_url), fetch_douyin_play_count(aweme_id),
+    )
+    if original_url:
+        result["original_url"] = original_url
+    if media:
+        result.update(media)
+        if original_url:
+            # HEAD 没有宽高/码率，不能把转码档的参数冒充原画参数。
+            result.update(quality="original", width=0, height=0, bitrate=0, fps=0)
+    if count is not None:
+        result["play_count"] = count
+    if original_url and result.get("url") == original_url and not media:
+        return False
+    return True
 
 
 async def resolve_short_url(url: str) -> str:
@@ -162,6 +234,35 @@ def extract_aweme_id(url: str) -> Optional[str]:
 
 
 # === 解析策略 ===
+
+async def strategy_web_api_open(aweme_id: str) -> Optional[dict]:
+    """带开放平台来源头请求详情，不发送 Cookie 或签名。"""
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Origin": "https://open.douyin.com",
+        "Referer": "https://open.douyin.com/",
+        "Accept": "application/json, text/plain, */*",
+    }
+    params = {"aweme_id": aweme_id, "aid": "6383", "device_platform": "webapp"}
+    async with httpx.AsyncClient(timeout=8, follow_redirects=False) as client:
+        try:
+            resp = await client.get(
+                "https://www.douyin.com/aweme/v1/web/aweme/detail/",
+                params=params, headers=headers,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            detail = data.get("aweme_detail") if data.get("status_code") == 0 else None
+            if not isinstance(detail, dict) or str(detail.get("aweme_id")) != aweme_id:
+                return None
+            result = parse_aweme_detail(detail)
+            if not (result.get("url") or result.get("images")):
+                return None
+            result["source"] = "web_api_open"
+            return result
+        except (httpx.HTTPError, ValueError, TypeError, AttributeError):
+            return None
+
 
 async def strategy_iesdouyin_api(aweme_id: str) -> Optional[dict]:
     """
@@ -416,140 +517,6 @@ def extract_from_html(html: str, aweme_id: str) -> Optional[dict]:
     return None
 
 
-def parse_iesdouyin_item(item: dict) -> dict:
-    """解析iesdouyin API返回的item数据"""
-    video = item.get("video", {})
-    author = item.get("author", {})
-
-    play_addr = video.get("play_addr", {})
-    uri = play_addr.get("uri", "")
-    url_list = play_addr.get("url_list", [])
-
-    nwm_url = ""
-
-    # bit_rate 取最高码率（无水印）
-    bit_rate = video.get("bit_rate", [])
-    if bit_rate:
-        sorted_rates = sorted(bit_rate, key=lambda x: x.get("bit_rate", 0), reverse=True)
-        best_urls = sorted_rates[0].get("play_addr", {}).get("url_list", [])
-        if best_urls:
-            nwm_url = best_urls[0]
-            if "playwm" in nwm_url:
-                nwm_url = nwm_url.replace("playwm", "play")
-
-    # video_id 构造
-    if not nwm_url and uri:
-        nwm_url = f"https://aweme.snssdk.com/aweme/v1/play/?video_id={uri}&ratio=1080p&line=0"
-    elif not nwm_url and url_list:
-        nwm_url = url_list[0].replace("playwm", "play")
-
-    return {
-        "type": "video",
-        "title": item.get("desc", ""),
-        "url": nwm_url,
-        "video_id": uri,
-        "cover": (video.get("cover", {}).get("url_list") or [""])[0],
-        "duration": video.get("duration", 0),
-        "author": {
-            "name": author.get("nickname", ""),
-            "id": author.get("unique_id") or author.get("short_id", ""),
-            "avatar": (author.get("avatar_thumb", {}).get("url_list") or [""])[0],
-        },
-        "music": {
-            "title": item.get("music", {}).get("title", ""),
-            "url": (item.get("music", {}).get("play_url", {}).get("url_list") or [""])[0] if isinstance(item.get("music", {}).get("play_url"), dict) else item.get("music", {}).get("play_url", ""),
-        },
-        "source": "iesdouyin_api",
-    }
-
-
-def parse_aweme_detail(detail: dict) -> dict:
-    """解析aweme_detail完整数据"""
-    video = detail.get("video", {})
-    author = detail.get("author", {})
-    images = detail.get("images") or []
-
-    if images:
-        image_urls = []
-        for img in images:
-            url_list = img.get("url_list", [])
-            if url_list:
-                image_urls.append(url_list[-1])
-        return {
-            "type": "image",
-            "title": detail.get("desc", ""),
-            "images": image_urls,
-            "cover": (video.get("cover", {}).get("url_list") or [""])[0],
-            "author": {
-                "name": author.get("nickname", ""),
-                "id": author.get("unique_id") or author.get("short_id", ""),
-                "avatar": (author.get("avatar_thumb", {}).get("url_list") or [""])[0],
-            },
-            "music": {
-                "title": detail.get("music", {}).get("title", ""),
-                "url": (detail.get("music", {}).get("play_url", {}).get("url_list") or [""])[0] if isinstance(detail.get("music", {}).get("play_url"), dict) else "",
-            },
-            "source": "ssr_detail",
-        }
-
-    # 视频
-    play_addr = video.get("play_addr", {})
-    uri = play_addr.get("uri", "")
-
-    # 优先级: bit_rate最高码率(无水印) > play_addr > video_id构造
-    nwm_url = ""
-
-    # 1. bit_rate: 按码率数值降序排列，取最高的无水印链接
-    bit_rate = video.get("bit_rate", [])
-    if bit_rate:
-        sorted_rates = sorted(bit_rate, key=lambda x: x.get("bit_rate", 0), reverse=True)
-        best = sorted_rates[0]
-        best_urls = best.get("play_addr", {}).get("url_list", [])
-        if best_urls:
-            nwm_url = best_urls[0]
-            if "playwm" in nwm_url:
-                nwm_url = nwm_url.replace("playwm", "play")
-
-    # 2. play_addr直接取
-    if not nwm_url and play_addr.get("url_list"):
-        nwm_url = play_addr["url_list"][0].replace("playwm", "play")
-
-    # 3. video_id构造
-    if not nwm_url and uri:
-        nwm_url = f"https://aweme.snssdk.com/aweme/v1/play/?video_id={uri}&ratio=1080p&line=0"
-
-    # 码率信息
-    selected_bitrate = 0
-    selected_quality = ""
-    if bit_rate:
-        sorted_rates = sorted(bit_rate, key=lambda x: x.get("bit_rate", 0), reverse=True)
-        selected_bitrate = sorted_rates[0].get("bit_rate", 0)
-        selected_quality = sorted_rates[0].get("gear_name", "")
-
-    return {
-        "type": "video",
-        "title": detail.get("desc", ""),
-        "url": nwm_url,
-        "video_id": play_addr.get("uri", ""),
-        "cover": (video.get("cover", {}).get("url_list") or [""])[0],
-        "duration": video.get("duration", 0),
-        "width": play_addr.get("width", 0),
-        "height": play_addr.get("height", 0),
-        "bitrate": selected_bitrate,
-        "quality": selected_quality,
-        "author": {
-            "name": author.get("nickname", ""),
-            "id": author.get("unique_id") or author.get("short_id", ""),
-            "avatar": (author.get("avatar_thumb", {}).get("url_list") or [""])[0],
-        },
-        "music": {
-            "title": detail.get("music", {}).get("title", ""),
-            "url": (detail.get("music", {}).get("play_url", {}).get("url_list") or [""])[0] if isinstance(detail.get("music", {}).get("play_url"), dict) else "",
-        },
-        "source": "ssr_detail",
-    }
-
-
 # === API路由 ===
 
 @app.get("/api/parse")
@@ -581,10 +548,9 @@ async def parse_video(url: str = Query(..., description="视频分享链接")):
             return {"code": 400, "msg": f"无法提取视频ID, URL: {resolved_url}", "data": None}
 
         # 策略优先级:
-        # 1. 签名API+curl_cffi (毫秒级，需首次浏览器获取Cookie)
-        # 2. 浏览器渲染拦截 (可靠但慢~10秒)
-        # 3. 公开API兜底 (依赖第三方)
+        # 1. 免 Cookie 详情；2. 签名 API；3. 浏览器；4. 第三方 API。
         strategies = [
+            ("免Cookie详情API", lambda: strategy_web_api_open(aweme_id)),
             ("签名API直连", lambda: strategy_web_api_with_signature(aweme_id)),
         ]
         if BROWSER_AVAILABLE:
@@ -595,11 +561,8 @@ async def parse_video(url: str = Query(..., description="视频分享链接")):
             print(f"  尝试: {name}...")
             result = await fn()
             if result:
-                # 预解析snssdk重定向为CDN直链，加速后续下载
-                if result.get("url") and "snssdk.com" in result["url"]:
-                    resolved = await resolve_video_redirect(result["url"])
-                    if resolved:
-                        result["url"] = resolved
+                if not await enrich_douyin_video(result, aweme_id):
+                    continue
                 return {"code": 200, "msg": f"解析成功({name})", "data": result, "platform": "douyin"}
 
         return {"code": 500, "msg": "所有策略均失败", "data": {"aweme_id": aweme_id}}
@@ -634,7 +597,7 @@ async def parse_video(url: str = Query(..., description="视频分享链接")):
 @app.get("/api/status")
 async def status():
     from cookie_manager import get_cookies, COOKIE_FILE
-    strats = ["iesdouyin_api", "mobile_page", "desktop_ssr", "signature_api"]
+    strats = ["web_api_open", "signature_api"]
     if BROWSER_AVAILABLE:
         strats.append("browser_render")
     strats.append("public_api")
@@ -668,6 +631,7 @@ async def test_strategies(aweme_id: str = Query(...)):
     results = {}
 
     strategies = [
+        ("web_api_open", lambda: strategy_web_api_open(aweme_id)),
         ("iesdouyin_api", lambda: strategy_iesdouyin_api(aweme_id)),
         ("mobile_page", lambda: strategy_mobile_share_page(aweme_id)),
         ("desktop_ssr", lambda: strategy_desktop_ssr(aweme_id)),
@@ -820,7 +784,7 @@ def detect_platform(url: str) -> str:
 
 
 def _is_safe_download_url(url: str) -> bool:
-    """Reject non-HTTP targets and hosts that resolve to private networks."""
+    """校验公网目标；已知抖音 HTTPS 媒体兼容代理的 Fake-IP DNS。"""
     try:
         parsed = urllib.parse.urlparse(url)
         host = parsed.hostname
@@ -829,12 +793,23 @@ def _is_safe_download_url(url: str) -> bool:
         if host.lower() in {"localhost", "localhost.localdomain"} or host.lower().endswith(".local"):
             return False
 
+        trusted_fake_dns = (
+            parsed.scheme == "https" and parsed.port in (None, 443)
+            and (
+                host == "aweme.snssdk.com"
+                or host.endswith(".douyinvod.com")
+                or host.endswith(".zjcdn.com")
+            )
+        )
+        fake_networks = (ipaddress.ip_network("198.18.0.0/15"), ipaddress.ip_network("2001:2::/48"))
         addresses = {info[4][0] for info in socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)}
         for address in addresses:
             ip = ipaddress.ip_address(address)
+            if trusted_fake_dns and any(ip in network for network in fake_networks):
+                continue
             if any((ip.is_private, ip.is_loopback, ip.is_link_local, ip.is_reserved, ip.is_multicast, ip.is_unspecified)):
                 return False
-        return True
+        return bool(addresses)
     except (OSError, ValueError):
         return False
 

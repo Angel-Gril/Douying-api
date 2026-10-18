@@ -14,6 +14,8 @@ jobs:
           python-version: "3.11"
       - name: Install dependencies
         run: pip install -r requirements-dev.txt
+      - name: Install Chromium for UI tests
+        run: playwright install --with-deps chromium
       - name: Compile Python modules
         run: python -m compileall -q .
       - name: Run tests

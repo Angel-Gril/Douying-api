@@ -4,7 +4,9 @@
 
 ## 特性
 
-- 抖音多策略解析：签名 API、Playwright 浏览器拦截、公开 API 兜底
+- 抖音多策略解析：免 Cookie 详情优先，签名 API、Playwright 浏览器和公开 API 兜底
+- 抖音原画入口与 CDN 探测、全部转码画质及备用链接、可选播放量
+- 网页按画质分别下载，展示分辨率、帧率、编码、码率和文件大小
 - 小红书和快手原生页面/API 提取
 - 图集、视频元数据和无水印直链统一返回
 - 下载代理带公网地址校验，避免把服务变成 SSRF 入口
@@ -42,6 +44,7 @@ curl "http://localhost:8848/api/status"
 ```text
 .
 ├── server.py              # FastAPI 应用和路由
+├── douyin_parser.py       # 抖音详情、转码画质及精选页播放量格式化
 ├── platform_parsers.py    # 小红书、快手解析器
 ├── browser_parser.py      # Playwright 浏览器解析器
 ├── cookie_manager.py      # Cookie 获取和缓存
@@ -53,13 +56,17 @@ curl "http://localhost:8848/api/status"
 ```
 
 更多说明见 [docs/使用说明.md](docs/使用说明.md) 和 [docs/部署指南.md](docs/部署指南.md)。
+抖音接口依据、字段含义与核验结果见 [docs/抖音解析接口.md](docs/抖音解析接口.md)。
 
 ## 测试
 
 ```bash
 pip install -r requirements-dev.txt
+playwright install chromium
 pytest -q
 ```
+
+测试包含实际 Chromium 页面交互；Linux CI 会同时安装浏览器所需的系统依赖。
 
 ## 免责声明
 
