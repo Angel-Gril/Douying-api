@@ -19,4 +19,4 @@ jobs:
       - name: Compile Python modules
         run: python -m compileall -q .
       - name: Run tests
-        run: pytest -q
+        run: python -m pytest -q

@@ -63,7 +63,7 @@ curl "http://localhost:8848/api/status"
 ```bash
 pip install -r requirements-dev.txt
 playwright install chromium
-pytest -q
+python -m pytest -q
 ```
 
 测试包含实际 Chromium 页面交互；Linux CI 会同时安装浏览器所需的系统依赖。
