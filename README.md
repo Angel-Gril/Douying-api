@@ -68,7 +68,7 @@ python -m pytest -q
 
 测试包括原生响应、接口适配、下载任务、真实小型媒体合并和 Chromium 交互。Linux 环境安装浏览器时可使用 `playwright install --with-deps chromium`。
 
-原理和测试记录见 [解析原理与开发测试](docs/解析原理与开发测试.md)，接口用法见 [使用说明](docs/使用说明.md)，运行说明见 [部署指南](docs/部署指南.md)。
+逐接口参数、curl 和 Python 调用、任务轮询及错误处理见 [接口调用手册](docs/接口调用手册.md)。页面操作见 [使用说明](docs/使用说明.md)，实现逻辑和测试记录见 [解析原理与开发测试](docs/解析原理与开发测试.md)，运行说明见 [部署指南](docs/部署指南.md)。
 
 ## License
 
