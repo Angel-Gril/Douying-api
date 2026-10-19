@@ -31,7 +31,7 @@ python server.py
 
 音视频与 HLS 合并使用本地 FFmpeg。Linux 使用系统包管理器安装，并通过 `FFMPEG_PATH` 指定系统程序；Windows 可使用运行依赖提供的程序。当前下载任务状态位于进程内，部署时使用单 worker。
 
-网页也可发布到 GitHub Pages，并在“解析服务设置”连接 HTTPS 后端。项目提供用于抖音直链测试的轻量 Workers 入口，复用现有解析器；构建、免费测试及能力范围见 [演示页部署](docs/演示页部署.md)。
+在线演示：[GitHub Pages](https://angel-gril.github.io/Douying-api/)，在“解析服务设置”连接 HTTPS 后端。项目提供用于抖音直链测试的轻量 Workers 入口，复用现有解析器；构建、免费测试及能力范围见 [演示页部署](docs/演示页部署.md)。
 
 ## 接口
 
