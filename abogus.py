@@ -15,6 +15,8 @@ Changes Made:
 1. Changed the ua_code to compatible with the current config file User-Agent string in https://github.com/Evil0ctal/Douyin_TikTok_Download_API/blob/main/crawlers/douyin/web/config.yaml
 """
 
+from __future__ import annotations
+
 from random import choice
 from random import randint
 from random import random
@@ -54,7 +56,7 @@ class ABogus:
 
     def __init__(self,
                  # user_agent: str = USERAGENT,
-                 platform: str = None, ):
+                 platform: str = None, user_agent: str = None, browser_info: str = None):
         self.chunk = []
         self.size = 0
         self.reg = self.__reg[:]
@@ -93,8 +95,11 @@ class ABogus:
             96,
             138,
             252]
-        self.browser = self.generate_browser_info(
-            platform) if platform else self.__browser
+        if user_agent:
+            # 现有 RC4/Base64/SM3 原语按本次请求 UA 计算，不能使用另一设备的固定摘要。
+            encoded_ua = self.generate_result(self.rc4_encrypt(user_agent, self.__ua_key), "s3")
+            self.ua_code = self.sm3_to_array(encoded_ua)
+        self.browser = browser_info or (self.generate_browser_info(platform) if platform else self.__browser)
         self.browser_len = len(self.browser)
         self.browser_code = self.char_code_at(self.browser)
 

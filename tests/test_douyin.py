@@ -7,6 +7,7 @@ import pytest
 from curl_cffi.requests import Session
 
 import server
+import media_downloads
 from browser_parser import _format_result
 
 
@@ -114,6 +115,7 @@ def test_image_detail_remains_an_image(detail):
 def upstream(monkeypatch, detail):
     state = {"detail": detail, "original_status": 302, "count": 12345, "count_gid": detail["aweme_id"], "requests": []}
     real_client = httpx.AsyncClient
+    monkeypatch.setattr(media_downloads, "TRUSTED_MEDIA_DOMAINS", media_downloads.TRUSTED_MEDIA_DOMAINS + ("example",))
 
     def handle(request):
         state["requests"].append(request)

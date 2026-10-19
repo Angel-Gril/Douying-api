@@ -49,7 +49,7 @@
         .btn-parse:hover { opacity: 0.9; }
         .btn-parse:active { transform: scale(0.97); }
         .btn-parse:disabled { opacity: 0.4; cursor: not-allowed; }
-        button:focus-visible, input:focus-visible, summary:focus-visible {
+        button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-visible, a:focus-visible {
             outline: 2px solid #a5b4fc; outline-offset: 3px;
         }
         .platforms {
@@ -75,7 +75,7 @@
         .quality-count { color: #9298b5; font-size: 12px; }
         .quality-list { display: grid; gap: 8px; }
         .download-item {
-            display: flex; align-items: center; justify-content: space-between; gap: 12px;
+            display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px;
             padding: 12px; background: #0a0a1a; border: 1px solid #2a2a4a; border-radius: 6px;
         }
         .download-info { flex: 1; min-width: 0; }
@@ -89,6 +89,32 @@
         .download-button:hover { background: #788ef3; }
         .download-button:disabled { opacity: 0.6; cursor: wait; }
         .quality-note { margin-top: 8px; color: #a0a6bf; font-size: 12px; line-height: 1.7; }
+        .download-section { margin-top: 20px; }
+        .download-actions { display: flex; align-items: center; gap: 8px; }
+        .secondary-button {
+            min-height: 44px; padding: 8px 12px; border: 1px solid #454566; border-radius: 5px;
+            background: #1a1a3a; color: #c8cce8; font-size: 12px; cursor: pointer;
+        }
+        .secondary-button:hover { border-color: #788ef3; }
+        .secondary-button:disabled { opacity: .6; cursor: wait; }
+        [hidden] { display: none !important; }
+        .download-feedback { flex-basis: 100%; }
+        .download-status { color: #a0a6bf; font-size: 12px; line-height: 1.7; overflow-wrap: anywhere; }
+        .download-status.error { color: #fca5a5; }
+        .download-progress { display: block; width: 100%; height: 5px; margin-top: 8px; accent-color: #788ef3; }
+        .native-download { margin-top: 8px; }
+        .media-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(220px, 100%), 1fr)); gap: 12px; }
+        .media-card { min-width: 0; border: 1px solid #2a2a4a; border-radius: 6px; overflow: hidden; }
+        .media-preview { display: block; width: 100%; height: 220px; object-fit: contain; background: #0a0a1a; }
+        .media-body { padding: 10px; display: grid; gap: 8px; }
+        .media-body .download-item { padding: 8px; gap: 8px; }
+        .media-body .download-label { font-size: 12px; }
+        .media-body .download-button { padding-inline: 12px; }
+        .parts-controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 8px; }
+        .parts-controls select { flex: 1; min-width: 0; max-width: 100%; min-height: 44px; padding: 8px; border: 1px solid #454566; border-radius: 5px; background: #0a0a1a; color: #e0e0e0; }
+        .save-preference { display: flex; align-items: center; gap: 7px; color: #a0a6bf; font-size: 12px; margin-bottom: 12px; }
+        .save-preference input { accent-color: #788ef3; }
+        @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } }
         @media (max-width: 480px) {
             .container { padding: 24px 16px; }
             .result { padding: 16px; }
@@ -145,6 +171,8 @@
 
 <script>
 const API_BASE = location.origin;
+const MEMORY_LIMIT = 256 * 1024 * 1024;
+const activeDownloads = new Map();
 
 async function checkStatus() {
     try {
@@ -163,9 +191,11 @@ async function checkStatus() {
     }
 }
 
-async function parse() {
-    const input = document.getElementById('urlInput').value.trim();
+async function parse(selectedUrl) {
+    const input = typeof selectedUrl === 'string' ? selectedUrl : document.getElementById('urlInput').value.trim();
     if (!input) return alert('请输入链接');
+    for (const state of activeDownloads.values()) cancelDownload(state.button);
+    if (selectedUrl) document.getElementById('urlInput').value = input;
 
     const box = document.getElementById('resultBox');
     const btn = document.getElementById('parseBtn');
@@ -209,22 +239,33 @@ function renderResult(resp) {
         <div style="font-size:14px;font-weight:600;margin-bottom:6px;line-height:1.4;word-break:break-all;">${title || '无标题'}</div>
         ${author ? `<div style="color:#888;font-size:12px;margin-bottom:4px;">@${esc(author)}</div>` : ''}
         <div style="display:flex;gap:6px;flex-wrap:wrap;">
-            <span style="padding:2px 8px;border-radius:10px;background:#667eea22;color:#667eea;font-size:11px;">${type === 'image' ? '图集' : '视频'}</span>
+            <span style="padding:2px 8px;border-radius:10px;background:#667eea22;color:#a5b4fc;font-size:11px;">${({image: '图集', live: '实况图'})[type] || '视频'}</span>
             <span style="padding:2px 8px;border-radius:10px;background:#4ade8022;color:#4ade80;font-size:11px;">${esc(platform)}</span>
             <span style="padding:2px 8px;border-radius:10px;background:#fbbf2422;color:#fbbf24;font-size:11px;">来源: ${esc(source)}</span>
-        </div>
+        </div>${workMetadata(d)}
     </div></div>`;
 
-    // 下载区
+    const parts = Array.isArray(d.parts) ? d.parts.filter(p => mediaUrl(p?.url)) : [];
+    if (parts.length) {
+        let currentPart = 1;
+        try { currentPart = Number(new URL(document.getElementById('urlInput').value, location.href).searchParams.get('p') || 1); } catch {}
+        html += `<section class="download-section"><h2 class="download-heading">分 P · ${parts.length} 集</h2>
+            <label class="quality-note" for="partSelect">选择分 P</label><div class="parts-controls">
+            <select id="partSelect" aria-label="选择分 P">${parts.map((p, i) => `<option value="${i}" data-url="${esc(mediaUrl(p.url))}" ${Number(p.index) === currentPart ? 'selected' : ''}>P${esc(p.index || i + 1)} · ${esc(p.title || '未命名')}${Number(p.duration) > 0 ? ' · ' + esc(formatDuration(p.duration)) : ''}</option>`).join('')}</select>
+            <button class="secondary-button" onclick="parseSelectedPart()">解析所选分 P</button></div>
+            <p class="quality-note">选择后解析该集，再选择需要下载的画质。</p></section>`;
+    }
+
     html += `<div style="margin-top:16px;padding-top:16px;border-top:1px solid #2a2a4a;">`;
+    if (typeof window.showSaveFilePicker === 'function') html += `<label class="save-preference"><input type="checkbox" id="saveToDisk">直接保存到磁盘（适合大文件）</label>`;
 
     if (type === 'video' || d.url || d.play_info) {
-        const mainUrl = mediaUrl(d.url || d.play_info?.main);
+        const mainUrl = resourceUrl(d) || mediaUrl(d.play_info?.main);
         const videoTitle = rawTitle || '视频';
         html += `<h2 class="download-heading">视频下载</h2>`;
         if (mainUrl) {
             const label = d.quality === 'original' ? '原画' : `默认画质 · ${qualityLabel(d)}`;
-            html += dlItem(label, mainUrl, 'mp4', qualityDetails(d), `${videoTitle}_${label}`);
+            html += dlItem(label, mainUrl, d.format || 'mp4', qualityDetails(d), `${videoTitle}_${label}`, {...d, url: mainUrl});
         }
         if (d.original_url && d.quality !== 'original') {
             html += `<p class="quality-note">原画暂不可用，可下载下面的转码画质。</p>`;
@@ -232,37 +273,62 @@ function renderResult(resp) {
 
         const seen = new Set();
         const variants = (Array.isArray(d.video_backup) ? d.video_backup : []).filter(v => {
-            const url = mediaUrl(typeof v === 'string' ? v : v?.url);
-            if (!url || seen.has(url)) return false;
-            seen.add(url);
+            const url = resourceUrl(v);
+            const key = JSON.stringify([url, v?.codec, v?.bit_rate, v?.quality, v?.audio_url]);
+            if (!url || seen.has(key)) return false;
+            seen.add(key);
             return true;
         });
         if (variants.length) {
             html += `<div class="quality-heading"><h2>全部转码画质</h2><span class="quality-count">${variants.length} 档</span></div><div class="quality-list">`;
             variants.forEach(v => {
-                if (typeof v === 'string') { html += dlItem('备用画质', v); return; }
+                if (typeof v === 'string') { html += dlItem('备用画质', v, 'mp4', '', `${videoTitle}_备用画质`); return; }
                 const label = qualityLabel(v);
                 const filename = `${videoTitle}_${label}_${v.codec || ''}_${v.bit_rate || ''}`;
-                html += dlItem(label, v.url, v.format || 'mp4', qualityDetails(v), filename);
+                html += dlItem(label, resourceUrl(v), v.format || 'mp4', qualityDetails(v), filename,
+                    {...v, audio_url: v.audio_url || d.audio_url, requires_mux: v.requires_mux ?? d.requires_mux});
             });
             html += `</div>`;
         }
         if (!mainUrl && !variants.length) html += `<p class="quality-note">未找到视频直链</p>`;
     }
 
-    if (type === 'image' && d.images?.length) {
-        html += `<div style="font-size:12px;color:#888;margin-bottom:8px;">图集 (${d.images.length}张)</div>`;
-        html += `<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:8px;">`;
-        d.images.forEach((img, i) => {
-            const src = mediaUrl(typeof img === 'string' ? img : (img.url || img.url_list?.[0]));
-            if (src) html += `<a href="${esc(src)}" target="_blank" rel="noopener" download><img src="${esc(src)}" alt="图片 ${i + 1}" style="width:100%;border-radius:4px;" loading="lazy"></a>`;
+    const audios = Array.isArray(d.audio_backup) ? d.audio_backup.filter(a => resourceUrl(a)) : [];
+    if (mediaUrl(d.audio_url) && !audios.some(a => resourceUrl(a) === mediaUrl(d.audio_url))) audios.unshift({url: d.audio_url, quality: '默认音轨', format: 'm4a'});
+    if (audios.length) {
+        html += `<section class="download-section"><h2 class="download-heading">音轨下载</h2><div class="quality-list">`;
+        audios.forEach((a, i) => {
+            const label = a.quality || `音轨 ${i + 1}`;
+            html += dlItem(label, resourceUrl(a), a.format === 'm4s' ? 'm4a' : a.format || 'm4a', qualityDetails(a), `${rawTitle || '视频'}_${label}_${a.codec || ''}_${a.bit_rate || ''}`);
         });
-        html += `</div>`;
+        html += `</div></section>`;
+    }
+
+    const pairs = (Array.isArray(d.live_photo) ? d.live_photo : []).map(p => ({image: mediaUrl(p?.image), video: mediaUrl(p?.video)})).filter(p => p.image || p.video);
+    const pairedImages = new Set(pairs.map(p => p.image));
+    const images = [...new Set((Array.isArray(d.images) ? d.images : []).map(resourceUrl).filter(Boolean))];
+    const stills = images.filter(url => !pairedImages.has(url));
+    const galleryUrls = [...new Set([...images, ...pairs.flatMap(p => [p.image, p.video])].filter(Boolean))];
+    if (galleryUrls.length) {
+        html += `<section class="download-section"><h2 class="download-heading">${pairs.length ? `实况图 · ${pairs.length} 组` : `图集 · ${stills.length} 张`}</h2>`;
+        if (galleryUrls.length > 1 && galleryUrls.length <= 100) html += dlItem('全部打包 ZIP', '', 'zip', `${galleryUrls.length} 个资源${pairs.length ? ' · 包含照片与动态视频' : ''}`, `${rawTitle || '图集'}_全部`, {mode: 'zip', urls: galleryUrls});
+        if (galleryUrls.length > 100) html += `<p class="quality-note">资源超过 100 个，请分别下载所需照片与视频。</p>`;
+        html += `<div class="media-grid" style="margin-top:12px">`;
+        pairs.forEach((p, i) => {
+            html += `<article class="media-card">${p.image ? `<img class="media-preview" src="${esc(p.image)}" alt="实况 ${i + 1} 的照片" loading="lazy">` : ''}<div class="media-body">`;
+            if (p.image) html += dlItem(`实况 ${i + 1} · 照片`, p.image, fileExtension(p.image, 'jpg'), '', `${rawTitle || '实况'}_实况${i + 1}_照片`);
+            if (p.video) html += dlItem(`实况 ${i + 1} · 动态视频`, p.video, 'mp4', '', `${rawTitle || '实况'}_实况${i + 1}_动态视频`, {url: p.video});
+            html += `</div></article>`;
+        });
+        stills.forEach((url, i) => {
+            html += `<article class="media-card"><img class="media-preview" src="${esc(url)}" alt="图片 ${i + 1}" loading="lazy"><div class="media-body">${dlItem(`图片 ${i + 1}`, url, fileExtension(url, 'jpg'), '', `${rawTitle || '图集'}_图片${i + 1}`)}</div></article>`;
+        });
+        html += `</div></section>`;
     }
 
     if (d.music?.url) {
         html += `<div style="font-size:12px;color:#888;margin:12px 0 8px;">背景音乐</div>`;
-        html += dlItem(d.music.title || '音乐', d.music.url, 'mp3');
+        html += dlItem(d.music.title || '音乐', d.music.url, fileExtension(d.music.url, 'mp3'), '', `${rawTitle || '作品'}_${d.music.title || '音乐'}`);
     }
 
     html += `</div>`;
@@ -277,11 +343,12 @@ function renderResult(resp) {
 
 function qualityLabel(video) {
     const edge = Math.min(Number(video.width) || 0, Number(video.height) || 0);
-    const match = String(video.quality || '').match(/(?:^|_)(2160|1440|1080|720|540|360)(?:p|_|$)/);
+    const quality = String(video.quality || '');
+    const match = quality.match(/(?:^|[_\s])(2160|1440|1080|720|540|360)(?:p|_|\s|$)/i);
     const resolution = edge > 0 ? Math.round(edge) : Number(match?.[1] || 0);
     if (resolution === 2160) return '4K (2160p)';
     if (resolution === 1440) return '2K (1440p)';
-    return resolution ? `${resolution}p` : '备用画质';
+    return resolution ? `${resolution}p` : (quality && !/^(?:normal_|original$)/i.test(quality) ? quality : '备用画质');
 }
 
 function qualityDetails(video) {
@@ -309,32 +376,318 @@ function mediaUrl(value) {
     } catch { return ''; }
 }
 
-function dlItem(label, url, ext, metadata, filename) {
-    if (!mediaUrl(url)) return '';
-    ext = /^[a-z0-9]{1,8}$/i.test(ext || '') ? ext : 'mp4';
-    const safeName = String(filename || label).replace(/[^a-zA-Z0-9一-鿿._-]/g, '_');
-    const proxyUrl = API_BASE + '/api/download?url=' + encodeURIComponent(url) + '&filename=' + encodeURIComponent(safeName + '.' + ext);
+function resourceUrl(value) {
+    return mediaUrl(typeof value === 'string' ? value : value?.url || value?.url_list?.find(url => mediaUrl(url)));
+}
+
+function fileExtension(url, fallback) {
+    try {
+        const ext = new URL(url).pathname.match(/\.([a-z0-9]{1,8})$/i)?.[1]?.toLowerCase();
+        return ['jpg', 'jpeg', 'png', 'webp', 'gif', 'avif', 'heic', 'mp3', 'm4a', 'aac', 'flac', 'ogg', 'wav', 'mp4', 'mov', 'webm', 'flv'].includes(ext) ? ext : fallback;
+    } catch { return fallback; }
+}
+
+function formatDuration(milliseconds) {
+    const seconds = Math.floor(Number(milliseconds) / 1000);
+    return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
+}
+
+function workMetadata(data) {
+    const values = [];
+    if (typeof data.duration === 'number' && Number.isFinite(data.duration) && data.duration > 0) values.push(`时长 ${formatDuration(data.duration)}`);
+    const statistics = data.statistics || {};
+    const groups = [
+        ['播放', data.play_count, statistics.play_count, statistics.view_count, statistics.view],
+        ['点赞', statistics.like_count, statistics.digg_count, statistics.like],
+        ['评论', statistics.comment_count, statistics.reply],
+        ['收藏', statistics.collect_count, statistics.favorite_count, statistics.favorite],
+        ['分享', statistics.share_count, statistics.share],
+        ['投币', statistics.coin],
+    ];
+    for (const [label, ...candidates] of groups) {
+        const value = candidates.find(value => typeof value === 'number' && Number.isFinite(value) && value >= 0);
+        if (value !== undefined) values.push(`${label} ${value.toLocaleString('zh-CN')}`);
+    }
+    return values.length ? `<div class="download-meta work-metadata">${esc(values.join(' · '))}</div>` : '';
+}
+
+function parseSelectedPart() {
+    const select = document.getElementById('partSelect');
+    const url = mediaUrl(select?.selectedOptions[0]?.dataset.url);
+    if (url) parse(url);
+}
+
+function dlItem(label, url, ext = 'mp4', metadata = '', filename, resource = {}) {
+    url = mediaUrl(url);
+    if (!url && resource.mode !== 'zip') return '';
+    ext = /^[a-z0-9]{1,8}$/i.test(ext || '') ? ext.toLowerCase() : 'mp4';
+    const spec = {url};
+    if (resource.mode === 'zip') Object.assign(spec, {mode: 'zip', urls: resource.urls});
+    else if (resource.requires_mux) {
+        if (!mediaUrl(resource.audio_url)) return `<p class="quality-note">${esc(label)}：缺少可用音轨，请重新解析。</p>`;
+        Object.assign(spec, {mode: 'mux', audio_url: mediaUrl(resource.audio_url)});
+        metadata = [metadata, '合并音视频'].filter(Boolean).join(' · ');
+    } else if (resource.requires_concat || Array.isArray(resource.segments) && resource.segments.length > 1) {
+        Object.assign(spec, {mode: 'concat', urls: (resource.segments || []).map(resourceUrl).filter(Boolean)});
+        metadata = [metadata, '下载后合并分段'].filter(Boolean).join(' · ');
+    } else if (/^(?:hls|m3u8)$/i.test(resource.format || '') || /\.m3u8$/i.test(new URL(url).pathname)) {
+        spec.mode = 'hls';
+        metadata = [metadata, '下载并合并 HLS'].filter(Boolean).join(' · ');
+    }
+    if (spec.mode && spec.mode !== 'zip') ext = 'mp4';
+    const safeName = String(filename || label).replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').replace(/[. ]+$/g, '').slice(0, 160) || '媒体';
+    spec.filename = safeName + '.' + ext;
+    const proxyUrl = downloadProxy(spec);
     return `<div class="download-item">
         <div class="download-info"><div class="download-label">${esc(label)}</div>${metadata ? `<div class="download-meta">${esc(metadata)}</div>` : ''}</div>
-        <button class="download-button" aria-label="下载 ${esc(label)}" data-url="${esc(proxyUrl)}" onclick="startDownload(this)">下载</button>
+        <div class="download-actions"><button class="download-button" aria-label="下载 ${esc(label)}" data-url="${esc(proxyUrl)}" data-resource="${esc(JSON.stringify(spec))}" onclick="startDownload(this)">下载</button>
+        <button class="secondary-button cancel-download" aria-label="取消下载" onclick="cancelDownload(this)" hidden>取消</button></div>
+        <div class="download-feedback" hidden><div class="download-status" role="status" aria-live="polite"></div>
+        <progress class="download-progress" max="100" aria-label="下载进度" hidden></progress>
+        <button class="secondary-button native-download" onclick="nativeDownload(this)" hidden>交给浏览器下载</button></div>
     </div>`;
 }
 
-function startDownload(btn) {
-    const url = btn.getAttribute('data-url');
-    btn.textContent = '下载中...';
-    btn.style.opacity = '0.6';
-    btn.disabled = true;
-    const iframe = document.createElement('iframe');
-    iframe.style.display = 'none';
-    iframe.src = url;
-    document.body.appendChild(iframe);
-    setTimeout(() => {
-        btn.textContent = '下载';
-        btn.style.opacity = '1';
-        btn.disabled = false;
-        document.body.removeChild(iframe);
-    }, 5000);
+function downloadProxy(spec) {
+    return API_BASE + '/api/download?url=' + encodeURIComponent(spec.url || '') + '&filename=' + encodeURIComponent(spec.filename);
+}
+
+function formatBytes(bytes) {
+    const value = Math.max(0, Number(bytes) || 0);
+    const unit = value >= 1024 ** 3 ? 'GB' : value >= 1024 ** 2 ? 'MB' : value >= 1024 ? 'KB' : 'B';
+    return `${(value / ({GB: 1024 ** 3, MB: 1024 ** 2, KB: 1024, B: 1}[unit])).toFixed(unit === 'B' ? 0 : 2)} ${unit}`;
+}
+
+function downloadStatus(state, text, error = false) {
+    state.row.querySelector('.download-feedback').hidden = false;
+    const status = state.row.querySelector('.download-status');
+    status.textContent = text;
+    status.classList.toggle('error', error);
+}
+
+function transferProgress(state, bytes, total) {
+    const progress = state.row.querySelector('.download-progress');
+    progress.hidden = false;
+    if (total > 0) progress.value = Math.min(100, bytes / total * 100);
+    else progress.removeAttribute('value');
+    downloadStatus(state, `已接收 ${formatBytes(bytes)}${total > 0 ? ` / ${formatBytes(total)} · ${Math.floor(bytes / total * 100)}%` : ' · 总大小未知'}`);
+}
+
+function browserDownload(url, filename) {
+    const link = document.createElement('a');
+    link.href = url;
+    if (filename) link.download = filename;
+    link.hidden = true;
+    document.body.append(link);
+    link.click();
+    link.remove();
+}
+
+function nativeDownload(button) {
+    const row = button.closest('.download-item');
+    const spec = JSON.parse(row.querySelector('.download-button').dataset.resource);
+    browserDownload(downloadProxy(spec), spec.filename);
+    row.querySelector('.download-status').textContent = '已交给浏览器下载，请在浏览器下载列表中查看进度或取消。';
+    button.hidden = true;
+}
+
+function offerNativeDownload(state) {
+    downloadStatus(state, '文件超过页面 256 MB 内存上限，可交给浏览器下载；进度和取消由浏览器管理。');
+    state.row.querySelector('.native-download').hidden = false;
+    state.row.querySelector('.download-progress').hidden = true;
+}
+
+async function responseError(response) {
+    let message = `下载请求失败 (${response.status})`;
+    if (/json/i.test(response.headers.get('content-type') || '')) {
+        try {
+            const body = await response.json();
+            const detail = body.detail || body.msg || body.error;
+            if (typeof detail === 'string') message = detail;
+        } catch {}
+    }
+    return new Error(message);
+}
+
+async function streamDownload(state, spec, fileHandle) {
+    let response;
+    try { response = await fetch(downloadProxy(spec), {signal: state.controller.signal}); }
+    catch (error) {
+        if (error.name === 'AbortError') throw error;
+        throw new Error('下载连接中断或文件不完整，请重试');
+    }
+    if (!response.ok) throw await responseError(response);
+    const contentType = response.headers.get('content-type') || 'application/octet-stream';
+    if (/(?:json|html|xml)|^text\//i.test(contentType)) {
+        if (/json/i.test(contentType)) throw await responseError(response);
+        throw new Error('服务器返回错误页面，未保存为媒体文件');
+    }
+    const total = Number(response.headers.get('content-length')) || 0;
+    const verifyLength = !response.headers.get('content-encoding') || response.headers.get('content-encoding') === 'identity';
+    if (!fileHandle && total > MEMORY_LIMIT) {
+        state.controller.abort();
+        offerNativeDownload(state);
+        return;
+    }
+    if (!response.body) throw new Error('浏览器无法读取下载流，请使用浏览器下载');
+    const reader = response.body.getReader();
+    const chunks = [];
+    let received = 0;
+    if (fileHandle) state.writable = await fileHandle.createWritable();
+    transferProgress(state, 0, total);
+    try {
+        while (true) {
+            let chunk;
+            try { chunk = await reader.read(); }
+            catch (error) {
+                if (error.name === 'AbortError' || state.cancelRequested) throw new DOMException('Cancelled', 'AbortError');
+                throw new Error('文件传输中断或不完整，请重试');
+            }
+            const {done, value} = chunk;
+            if (done) break;
+            if (state.cancelRequested) throw new DOMException('Cancelled', 'AbortError');
+            if (!received && /^\s*(?:<!doctype\s+html|<html\b|<head\b|<body\b|<\?xml\b|[\[{])/i.test(new TextDecoder().decode(value.subarray(0, 160)))) throw new Error('资源内容是错误页面或 JSON，未保存为媒体文件');
+            received += value.byteLength;
+            if (!fileHandle && received > MEMORY_LIMIT) {
+                chunks.length = 0;
+                state.controller.abort();
+                offerNativeDownload(state);
+                return;
+            }
+            if (state.writable) await state.writable.write(value);
+            else chunks.push(value);
+            transferProgress(state, received, total);
+        }
+        if (!received) throw new Error('下载内容为空，请重新解析');
+        if (verifyLength && total && received !== total) throw new Error('文件不完整，实际字节数与声明大小不一致，请重试');
+        if (state.cancelRequested) throw new DOMException('Cancelled', 'AbortError');
+        if (state.writable) {
+            await state.writable.close();
+            state.writable = null;
+            downloadStatus(state, `已保存 ${formatBytes(received)}`);
+        } else {
+            const objectUrl = URL.createObjectURL(new Blob(chunks, {type: contentType.split(';')[0]}));
+            browserDownload(objectUrl, spec.filename);
+            // Blob URL lifetime is unrelated to transfer progress or completion.
+            setTimeout(() => URL.revokeObjectURL(objectUrl), 60000);
+            downloadStatus(state, `已接收 ${formatBytes(received)}，已交给浏览器保存。`);
+        }
+    } finally {
+        chunks.length = 0;
+        if (state.writable) {
+            await state.writable.abort().catch(() => {});
+            state.writable = null;
+        }
+        await reader.cancel().catch(() => {});
+        reader.releaseLock();
+    }
+}
+
+async function readJob(response) {
+    if (!response.ok) throw await responseError(response);
+    const envelope = await response.json();
+    if (envelope.code !== 200 || !envelope.data) throw new Error(envelope.msg || '下载任务请求失败');
+    return envelope.data;
+}
+
+async function cancelServerJob(state) {
+    if (!state.cancelPromise) state.cancelPromise = (async () => {
+        const job = await readJob(await fetch(`${API_BASE}/api/download/jobs/${encodeURIComponent(state.jobId)}`, {method: 'DELETE'}));
+        if (job.status !== 'cancelled') throw new Error('任务尚未取消，请稍后重试');
+        state.controller.abort();
+        downloadStatus(state, '下载已取消');
+    })();
+    return state.cancelPromise;
+}
+
+async function jobDownload(state, spec) {
+    let job = await readJob(await fetch(`${API_BASE}/api/download/jobs`, {
+        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(spec),
+    }));
+    if (typeof job.id !== 'string' || !job.id) throw new Error('服务器未返回任务编号');
+    state.jobId = job.id;
+    while (true) {
+        if (state.cancelRequested) {
+            await cancelServerJob(state);
+            throw new DOMException('Cancelled', 'AbortError');
+        }
+        const count = Number(job.total_items) > 0 ? ` · ${Number(job.completed_items) || 0}/${Number(job.total_items)} 项` : '';
+        downloadStatus(state, `${job.stage || '处理中'} · ${formatBytes(job.downloaded_bytes)}${count}`);
+        const progress = state.row.querySelector('.download-progress');
+        progress.hidden = false;
+        progress.removeAttribute('value');
+        if (job.status === 'completed') {
+            const artifact = new URL(job.download_url || '', API_BASE);
+            if (artifact.origin !== API_BASE || !/^\/api\/download\/jobs\/[^/]+\/file$/.test(artifact.pathname)) throw new Error('下载任务返回了无效的文件地址');
+            browserDownload(artifact.href, spec.filename);
+            progress.hidden = true;
+            downloadStatus(state, '文件已准备好，已交给浏览器下载；请在下载列表中查看保存状态。');
+            return;
+        }
+        if (job.status === 'failed') throw new Error(job.error || '下载任务失败，请重试');
+        if (job.status === 'cancelled') throw new DOMException('Cancelled', 'AbortError');
+        if (!['queued', 'downloading', 'processing'].includes(job.status)) throw new Error('服务器返回未知的任务状态');
+        await new Promise(resolve => setTimeout(resolve, 700));
+        if (state.cancelRequested) continue;
+        job = await readJob(await fetch(`${API_BASE}/api/download/jobs/${encodeURIComponent(state.jobId)}`, {signal: state.controller.signal}));
+    }
+}
+
+async function startDownload(button) {
+    if (activeDownloads.has(button)) return;
+    const spec = JSON.parse(button.dataset.resource);
+    const state = {button, row: button.closest('.download-item'), controller: new AbortController(), isJob: !!spec.mode, cancelRequested: false};
+    activeDownloads.set(button, state);
+    button.disabled = true;
+    button.textContent = spec.mode ? '处理中…' : '下载中…';
+    button.setAttribute('aria-busy', 'true');
+    const cancel = state.row.querySelector('.cancel-download');
+    cancel.hidden = false;
+    cancel.disabled = false;
+    state.row.querySelector('.native-download').hidden = true;
+    downloadStatus(state, spec.mode ? '正在创建下载任务…' : '正在连接下载…');
+    try {
+        if (spec.mode) await jobDownload(state, spec);
+        else {
+            let fileHandle;
+            if (document.getElementById('saveToDisk')?.checked && typeof window.showSaveFilePicker === 'function') {
+                downloadStatus(state, '请选择文件保存位置…');
+                fileHandle = await window.showSaveFilePicker({suggestedName: spec.filename});
+            }
+            if (state.cancelRequested) throw new DOMException('Cancelled', 'AbortError');
+            await streamDownload(state, spec, fileHandle);
+        }
+    } catch (error) {
+        if (error.name === 'AbortError') downloadStatus(state, '下载已取消');
+        else downloadStatus(state, error.message || '下载失败，请重试', true);
+    } finally {
+        activeDownloads.delete(button);
+        button.disabled = false;
+        button.textContent = '下载';
+        button.removeAttribute('aria-busy');
+        cancel.hidden = true;
+        state.row.querySelector('.download-progress').hidden = true;
+    }
+}
+
+async function cancelDownload(button) {
+    const mainButton = button.closest('.download-item').querySelector('.download-button');
+    const state = activeDownloads.get(mainButton);
+    if (!state || state.cancelRequested) return;
+    state.cancelRequested = true;
+    const cancel = state.row.querySelector('.cancel-download');
+    cancel.disabled = true;
+    downloadStatus(state, '正在取消下载…');
+    if (!state.isJob) state.controller.abort();
+    else if (state.jobId) {
+        try { await cancelServerJob(state); }
+        catch (error) {
+            state.cancelRequested = false;
+            state.cancelPromise = null;
+            cancel.disabled = false;
+            downloadStatus(state, error.message || '取消失败，请重试', true);
+        }
+    }
 }
 
 function esc(s) {

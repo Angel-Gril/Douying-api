@@ -6,6 +6,7 @@ Cookie管理器 - 混合策略 + 设备指纹随机化
 """
 
 import json
+import asyncio
 import time
 import random
 import string
@@ -16,6 +17,8 @@ COOKIE_FILE = Path(__file__).parent / ".douyin_cookies.json"
 COOKIE_TTL = 1800  # 30分钟有效期
 
 _cached: Optional[dict] = None
+_refresh_lock = None
+_refresh_loop = None
 
 _CHROME_VERSIONS = ["120.0.0.0", "121.0.0.0", "122.0.0.0", "123.0.0.0", "124.0.0.0", "125.0.0.0", "126.0.0.0"]
 _SCREEN_SIZES = [(1920, 1080), (2560, 1440), (1366, 768), (1536, 864), (1440, 900)]
@@ -37,6 +40,15 @@ def _random_browser_fingerprint() -> dict:
 
 
 async def get_cookies() -> dict:
+    global _refresh_lock, _refresh_loop
+    loop = asyncio.get_running_loop()
+    if _refresh_loop is not loop:
+        _refresh_lock, _refresh_loop = asyncio.Lock(), loop
+    async with _refresh_lock:
+        return await _get_cookies_locked()
+
+
+async def _get_cookies_locked() -> dict:
     """返回 {cookie_str: "k=v; ...", names: [...], time: ...}"""
     global _cached
 
@@ -128,7 +140,7 @@ async def _fetch_cookies_via_browser() -> Optional[dict]:
         if "msToken" not in names:
             print("[Cookie] 警告: 未获取到msToken，签名API可能不稳定")
 
-        return {"cookie_str": cookie_str, "names": names, "time": time.time()}
+        return {"cookie_str": cookie_str, "names": names, "time": time.time(), "fingerprint": fp}
 
     except Exception as e:
         print(f"[Cookie] 获取失败: {e}")

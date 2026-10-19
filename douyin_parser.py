@@ -43,12 +43,31 @@ def parse_aweme_detail(detail: dict) -> dict:
         "music": {"title": music.get("title", ""), "url": music_url},
         "source": "ssr_detail",
     }
+    raw_statistics = detail.get("statistics") or {}
+    statistics = {key: value for key, value in raw_statistics.items() if key.endswith("_count") and type(value) is int and value >= 0} if isinstance(raw_statistics, dict) else {}
+    if statistics:
+        result["statistics"] = statistics
+        if "play_count" in statistics:
+            result["play_count"] = statistics["play_count"]
     images = detail.get("images") or []
     if images:
+        live = []
+        for image in images:
+            still = (image.get("url_list") or [""])[-1]
+            motion = image.get("video") or image.get("video_info") or image.get("videoInfo") or {}
+            urls = _play_urls(motion.get("play_addr") or {})
+            if not urls:
+                urls = [item.get("src") for item in motion.get("playAddr", []) if isinstance(item, dict) and isinstance(item.get("src"), str)]
+            if not urls and isinstance(motion.get("playApi"), str):
+                urls = [motion["playApi"]]
+            if still and urls and str(urls[0]).startswith(("https://", "http://")):
+                live.append({"image": still, "video": urls[0].replace("playwm", "play")})
         result.update({
-            "type": "image",
+            "type": "live" if live else "image",
             "images": [img["url_list"][-1] for img in images if img.get("url_list")],
         })
+        if live:
+            result["live_photo"] = live
         return result
 
     backups = []

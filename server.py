@@ -13,13 +13,15 @@ import time
 import random
 import urllib.parse
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Literal
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse
+from pydantic import BaseModel, Field
 
 try:
     from browser_parser import parse_douyin_by_browser
@@ -28,6 +30,10 @@ except ImportError:
     BROWSER_AVAILABLE = False
 
 from platform_parsers import parse_xiaohongshu, parse_kuaishou
+from media_downloads import MediaError, download_response, is_safe_media_url
+from media_downloads import create_download_job, download_job_status, cancel_download_job, remove_download_job, DOWNLOAD_JOBS, ffmpeg_path
+from bilibili_parser import parse_bilibili
+from public_api import parse_public_url, LEGACY_PATHS
 from douyin_parser import (
     build_original_video_url, extract_play_count, parse_aweme_detail, parse_iesdouyin_item,
 )
@@ -53,21 +59,6 @@ MOBILE_UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/
 DOUYIN_COOKIE = os.getenv("DOUYIN_COOKIE", "").strip()
 ENABLE_DEBUG_ENDPOINTS = os.getenv("ENABLE_DEBUG_ENDPOINTS", "0").lower() in {"1", "true", "yes"}
 
-# 公开API备用列表
-PUBLIC_APIS = [
-    "https://api.bugpk.com/api/douyin?url={url}",
-]
-DOUBAO_APIS = [
-    "https://api.bugpk.com/api/dbvideos?url={url}",
-]
-XHS_APIS = [
-    "https://api.bugpk.com/api/xhs?url={url}",
-]
-KUAISHOU_APIS = [
-    "https://api.bugpk.com/api/kuaishou?url={url}",
-]
-
-
 # === 设备指纹随机化 ===
 
 _CHROME_VERSIONS = [
@@ -84,7 +75,10 @@ _DEVICE_MEMORY = [4, 8, 16, 32]
 
 def generate_device_fingerprint() -> dict:
     """生成随机但合理的设备指纹，模拟不同真实用户"""
-    chrome_ver, impersonate_key = random.choice(_CHROME_VERSIONS)
+    from curl_cffi.requests.impersonate import BrowserType
+    supported = {profile.value for profile in BrowserType}
+    candidates = [(version, profile) for version, profile in _CHROME_VERSIONS if profile in supported]
+    chrome_ver, impersonate_key = random.choice(candidates) if candidates else ("124.0.0.0", "chrome")
     screen = random.choice(_SCREEN_SIZES)
     cores = random.choice(_CPU_CORES)
     memory = random.choice(_DEVICE_MEMORY)
@@ -172,7 +166,7 @@ async def fetch_douyin_play_count(aweme_id: str) -> Optional[int]:
 
 async def enrich_douyin_video(result: dict, aweme_id: str) -> bool:
     """补充原画和播放量；只有未验证的构造入口时返回 False，继续后备策略。"""
-    if result.get("type") == "image":
+    if result.get("type") in {"image", "live"}:
         return True
     original_url = build_original_video_url(result.get("video_id"))
     probe_url = original_url
@@ -198,23 +192,23 @@ async def enrich_douyin_video(result: dict, aweme_id: str) -> bool:
 
 
 async def resolve_short_url(url: str) -> str:
-    """解析短链接302重定向"""
-    headers = {"User-Agent": MOBILE_UA}
-    async with httpx.AsyncClient(follow_redirects=True, timeout=10) as client:
+    """只在抖音站点之间跟随分享跳转，不把分享地址变成任意请求入口。"""
+    original = url
+    async with httpx.AsyncClient(follow_redirects=False, timeout=8) as client:
         try:
-            resp = await client.get(url, headers=headers)
-            return str(resp.url)
-        except Exception:
+            for _ in range(6):
+                if detect_platform(url) != "douyin":
+                    return original
+                response = await client.get(url, headers={"User-Agent": MOBILE_UA})
+                if response.status_code not in (301, 302, 303, 307, 308):
+                    return url
+                location = response.headers.get("location")
+                if not location:
+                    return original
+                url = urllib.parse.urljoin(url, location)
+        except httpx.HTTPError:
             pass
-    # 备用: 只跟一层
-    async with httpx.AsyncClient(follow_redirects=False, timeout=10) as client:
-        try:
-            resp = await client.get(url, headers=headers)
-            if resp.status_code in (301, 302, 303, 307, 308):
-                return str(resp.headers.get("location", url))
-        except Exception:
-            pass
-    return url
+    return original
 
 
 def extract_aweme_id(url: str) -> Optional[str]:
@@ -337,7 +331,7 @@ async def strategy_desktop_ssr(aweme_id: str) -> Optional[dict]:
     return None
 
 
-async def strategy_web_api_with_signature(aweme_id: str) -> Optional[dict]:
+async def _request_signed_douyin_detail(aweme_id: str) -> Optional[dict]:
     """
     策略4: Web API + a_bogus签名 + curl_cffi TLS指纹模拟
     签名生成和HTTP请求全部在独立线程中执行，避免与uvicorn事件循环冲突
@@ -345,7 +339,7 @@ async def strategy_web_api_with_signature(aweme_id: str) -> Optional[dict]:
     import asyncio
     from cookie_manager import get_cookies, invalidate
 
-    cookie_data = await get_cookies()
+    cookie_data = {} if DOUYIN_COOKIE else await get_cookies()
     cookie_str = DOUYIN_COOKIE or cookie_data.get("cookie_str", "")
     if not cookie_str:
         return None
@@ -357,13 +351,28 @@ async def strategy_web_api_with_signature(aweme_id: str) -> Optional[dict]:
         from curl_cffi.requests import Session
 
         fp = generate_device_fingerprint()
+        captured = cookie_data.get("fingerprint") or {}
+        if captured.get("user_agent"):
+            fp["user_agent"] = captured["user_agent"]
+            captured_version = re.search(r"Chrome/([\d.]+)", fp["user_agent"])
+            if captured_version:
+                fp["chrome_version"] = captured_version.group(1)
+                from curl_cffi.requests.impersonate import BrowserType
+                profiles = [p.value for p in BrowserType if re.fullmatch(r"chrome\d+", p.value)]
+                if profiles:
+                    major = int(captured_version.group(1).split(".")[0])
+                    fp["impersonate_key"] = min(profiles, key=lambda value: abs(int(value[6:]) - major))
+        if isinstance(captured.get("viewport"), dict):
+            fp["screen_width"] = str(captured["viewport"].get("width") or fp["screen_width"])
+            fp["screen_height"] = str(captured["viewport"].get("height") or fp["screen_height"])
         ua = fp["user_agent"]
         chrome_ver = fp["chrome_version"]
         impersonate_ver = fp["impersonate_key"]
 
         params = {
             "device_platform": "webapp", "aid": "6383", "channel": "channel_pc_web",
-            "aweme_id": aweme_id, "pc_client_type": "1", "version_code": "190500",
+            "aweme_id": aweme_id, "request_source": "600", "origin_type": "video_page",
+            "pc_client_type": "1", "version_code": "190500", "support_h265": "1", "support_dash": "0",
             "version_name": "19.5.0", "cookie_enabled": "true",
             "browser_language": "zh-CN", "browser_platform": "Win32",
             "browser_name": "Chrome", "browser_version": chrome_ver,
@@ -375,8 +384,15 @@ async def strategy_web_api_with_signature(aweme_id: str) -> Optional[dict]:
             "downlink": fp["downlink"], "effective_type": "4g",
             "round_trip_time": fp["round_trip_time"],
         }
+        cookie_values = dict(part.strip().split("=", 1) for part in cookie_str.split(";") if "=" in part)
+        for cookie_name, param_names in (("UIFID", ("uifid",)), ("s_v_web_id", ("verifyFp", "fp")), ("msToken", ("msToken",))):
+            if cookie_values.get(cookie_name):
+                for param_name in param_names:
+                    params[param_name] = cookie_values[cookie_name]
         qs = urlencode(params)
-        bogus = ABogus()
+        width, height = fp["screen_width"], fp["screen_height"]
+        browser_info = f"{width}|{height}|{width}|{height}|0|0|0|0|{width}|{height}|{width}|{height}|{width}|{height}|24|24|Win32"
+        bogus = ABogus(platform="Win32", user_agent=ua, browser_info=browser_info)
         ab = bogus.get_value(qs)
         xb = XBogus(user_agent=ua)
         _, xb_val, _ = xb.getXBogus(qs)
@@ -388,51 +404,35 @@ async def strategy_web_api_with_signature(aweme_id: str) -> Optional[dict]:
             "Cookie": cookie_str,
         }
         with Session(impersonate=impersonate_ver) as s:
-            return s.get(url, headers=hdrs, timeout=15)
+            return s.get(url, headers=hdrs, timeout=15, allow_redirects=False)
 
     try:
         resp = await asyncio.to_thread(_do_signed_request)
         if not resp.text:
-            invalidate()
+            if not DOUYIN_COOKIE:
+                invalidate()
             return None
         data = json.loads(resp.text)
         if data.get("status_code") == 0 and data.get("aweme_detail"):
-            result = parse_aweme_detail(data["aweme_detail"])
-            result["source"] = "web_api_signature"
-            return result
+            return data["aweme_detail"]
     except ImportError:
         pass
     except Exception as e:
-        import traceback
-        print(f"[策略4-签名API] {e}")
-        traceback.print_exc()
+        print(f"[签名API] 请求失败: {type(e).__name__}")
     return None
+
+
+async def strategy_web_api_with_signature(aweme_id: str) -> Optional[dict]:
+    detail = await _request_signed_douyin_detail(aweme_id)
+    if detail is None:
+        return None
+    result = parse_aweme_detail(detail)
+    result["source"] = "web_api_signature"
+    return result
 
 
 async def strategy_public_api(original_url: str, platform: str = "douyin") -> Optional[dict]:
-    """
-    公开API兜底 - 支持多平台
-    """
-    api_map = {
-        "doubao": DOUBAO_APIS,
-        "xiaohongshu": XHS_APIS,
-        "kuaishou": KUAISHOU_APIS,
-    }
-    apis = api_map.get(platform, PUBLIC_APIS)
-    async with httpx.AsyncClient(timeout=15) as client:
-        for api_template in apis:
-            api_url = api_template.format(url=urllib.parse.quote(original_url, safe=''))
-            try:
-                resp = await client.get(api_url)
-                data = resp.json()
-                if data.get("code") in (200, "200"):
-                    result = data.get("data", {})
-                    result["source"] = "public_api"
-                    return result
-            except Exception as e:
-                print(f"[公开API-{platform}] 失败: {e}")
-                continue
-    return None
+    return await parse_public_url(original_url, platform)
 
 
 # === 数据提取 ===
@@ -530,6 +530,8 @@ async def parse_video(url: str = Query(..., description="视频分享链接")):
         original_url = url_match.group(0)
 
     platform = detect_platform(original_url)
+    if platform == "unknown":
+        return {"code": 400, "msg": "链接格式无效或暂不支持该平台", "data": None}
 
     if platform == "doubao":
         result = await strategy_public_api(original_url, "doubao")
@@ -587,7 +589,12 @@ async def parse_video(url: str = Query(..., description="视频分享链接")):
             return {"code": 200, "msg": "解析成功(公开API)", "data": result, "platform": "kuaishou"}
         return {"code": 500, "msg": "快手解析失败", "data": None}
 
-    # 其他平台走公开API
+    if platform == "bilibili":
+        result = await parse_bilibili(original_url)
+        if result:
+            return {"code": 200, "msg": "解析成功(B站原生接口)", "data": result, "platform": platform}
+
+    # 其他已识别平台使用各自的公开供方路由。
     result = await strategy_public_api(original_url, platform)
     if result:
         return {"code": 200, "msg": "解析成功", "data": result, "platform": platform}
@@ -596,7 +603,7 @@ async def parse_video(url: str = Query(..., description="视频分享链接")):
 
 @app.get("/api/status")
 async def status():
-    from cookie_manager import get_cookies, COOKIE_FILE
+    from cookie_manager import COOKIE_FILE, COOKIE_TTL
     strats = ["web_api_open", "signature_api"]
     if BROWSER_AVAILABLE:
         strats.append("browser_render")
@@ -606,20 +613,27 @@ async def status():
     if DOUYIN_COOKIE:
         cookie_status = "manual"
     elif COOKIE_FILE.exists():
-        cookie_data = await get_cookies()
-        has_ms = "msToken" in cookie_data.get("names", [])
-        cookie_status = "auto_full" if has_ms else "auto_partial"
+        try:
+            cookie_data = json.loads(COOKIE_FILE.read_text(encoding="utf-8"))
+            if time.time() - cookie_data.get("time", 0) >= COOKIE_TTL:
+                cookie_status = "expired"
+            else:
+                has_ms = "msToken" in cookie_data.get("names", [])
+                cookie_status = "auto_full" if has_ms else "auto_partial"
+        except (OSError, ValueError, TypeError, AttributeError):
+            cookie_status = "none"
     else:
         cookie_status = "none"
 
     return {
         "status": "running",
         "cookie_status": cookie_status,
-        "cookie_configured": cookie_status != "none",
+        "cookie_configured": cookie_status not in {"none", "expired"},
         "browser_available": BROWSER_AVAILABLE,
         "strategies": strats,
-        "public_apis": len(PUBLIC_APIS),
-        "supported_platforms": ["douyin", "doubao", "kuaishou", "xiaohongshu", "bilibili", "weibo"],
+        "public_apis": len(LEGACY_PATHS),
+        "supported_platforms": list(LEGACY_PATHS),
+        "download_features": {"range": True, "progress": True, "cancel": True, "zip": True, "merge": True, "hls": "unencrypted_vod"},
     }
 
 
@@ -653,61 +667,10 @@ async def debug_video_data(aweme_id: str = Query(...)):
     """调试: 返回API原始video对象，用于分析可用画质"""
     if not ENABLE_DEBUG_ENDPOINTS:
         raise HTTPException(status_code=404, detail="调试接口未启用")
-    import asyncio
-    from cookie_manager import get_cookies, invalidate
-
-    cookie_data = await get_cookies()
-    cookie_str = DOUYIN_COOKIE or cookie_data.get("cookie_str", "")
-    if not cookie_str:
-        return {"error": "no cookie"}
-
-    def _do_request():
-        from abogus import ABogus
-        from xbogus import XBogus
-        from urllib.parse import quote, urlencode
-        from curl_cffi.requests import Session
-
-        fp = generate_device_fingerprint()
-        ua = fp["user_agent"]
-        chrome_ver = fp["chrome_version"]
-        impersonate_ver = fp["impersonate_key"]
-
-        params = {
-            "device_platform": "webapp", "aid": "6383", "channel": "channel_pc_web",
-            "aweme_id": aweme_id, "pc_client_type": "1", "version_code": "190500",
-            "version_name": "19.5.0", "cookie_enabled": "true",
-            "browser_language": "zh-CN", "browser_platform": "Win32",
-            "browser_name": "Chrome", "browser_version": chrome_ver,
-            "browser_online": "true", "engine_name": "Blink",
-            "engine_version": chrome_ver, "os_name": "Windows", "os_version": "10",
-            "cpu_core_num": fp["cpu_core_num"], "device_memory": fp["device_memory"],
-            "platform": "PC",
-            "screen_width": fp["screen_width"], "screen_height": fp["screen_height"],
-            "downlink": fp["downlink"], "effective_type": "4g",
-            "round_trip_time": fp["round_trip_time"],
-        }
-        qs = urlencode(params)
-        bogus = ABogus()
-        ab = bogus.get_value(qs)
-        xb = XBogus(user_agent=ua)
-        _, xb_val, _ = xb.getXBogus(qs)
-        url = f"https://www.douyin.com/aweme/v1/web/aweme/detail/?{qs}&a_bogus={quote(ab, safe='')}&X-Bogus={xb_val}"
-        hdrs = {
-            "User-Agent": ua,
-            "Referer": f"https://www.douyin.com/video/{aweme_id}",
-            "Accept": "application/json, text/plain, */*",
-            "Cookie": cookie_str,
-        }
-        with Session(impersonate=impersonate_ver) as s:
-            return s.get(url, headers=hdrs, timeout=15)
-
+    detail = await _request_signed_douyin_detail(aweme_id)
+    if detail is None:
+        return {"error": "api_failed"}
     try:
-        resp = await asyncio.to_thread(_do_request)
-        data = json.loads(resp.text)
-        if data.get("status_code") != 0 or not data.get("aweme_detail"):
-            return {"error": "api_failed", "status_code": data.get("status_code"), "raw": data}
-
-        detail = data["aweme_detail"]
         video = detail.get("video", {})
 
         # 提取关键字段用于分析
@@ -759,123 +722,108 @@ async def debug_video_data(aweme_id: str = Query(...)):
             "bit_rate_count": len(bit_rate),
             "bit_rate_details": bit_rate_summary,
         }
-    except Exception as e:
-        import traceback
-        return {"error": str(e), "trace": traceback.format_exc()}
+    except (TypeError, AttributeError, ValueError):
+        return {"error": "invalid_detail"}
 
 
 def detect_platform(url: str) -> str:
-    lower = url.lower()
-    if "doubao" in lower:
-        return "doubao"
-    if "douyin" in lower or "iesdouyin" in lower:
-        return "douyin"
-    if "kuaishou" in lower:
-        return "kuaishou"
-    if "xhs" in lower or "xiaohongshu" in lower:
-        return "xiaohongshu"
-    if "bilibili" in lower or "b23.tv" in lower:
-        return "bilibili"
-    if "weibo" in lower:
-        return "weibo"
-    if "toutiao" in lower:
-        return "toutiao"
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        host = parsed.hostname or ""
+        if parsed.scheme not in {"https", "http"} or parsed.username or parsed.password or parsed.port not in {None, 80, 443}:
+            return "unknown"
+    except ValueError:
+        return "unknown"
+    domains = {
+        "douyin": ("douyin.com", "iesdouyin.com"),
+        "doubao": ("doubao.com", "doubao.cn", "dola.com"),
+        "xiaohongshu": ("xiaohongshu.com", "xhslink.com", "xhs.com"),
+        "kuaishou": ("kuaishou.com", "chenzhongtech.com"),
+        "bilibili": ("bilibili.com", "b23.tv"),
+        "weibo": ("weibo.com", "weibo.cn"),
+        "toutiao": ("toutiao.com",),
+        "pipixia": ("pipix.com", "pipixia.com"),
+        "pipigx": ("pipigx.com", "ippzone.com"),
+        "zuiyou": ("xiaochuankeji.cn", "izuiyou.com"),
+    }
+    for platform, allowed in domains.items():
+        if any(host == domain or host.endswith("." + domain) for domain in allowed):
+            return platform
     return "unknown"
 
 
 def _is_safe_download_url(url: str) -> bool:
-    """校验公网目标；已知抖音 HTTPS 媒体兼容代理的 Fake-IP DNS。"""
-    try:
-        parsed = urllib.parse.urlparse(url)
-        host = parsed.hostname
-        if parsed.scheme not in {"http", "https"} or not host or parsed.username or parsed.password:
-            return False
-        if host.lower() in {"localhost", "localhost.localdomain"} or host.lower().endswith(".local"):
-            return False
+    return is_safe_media_url(url)
 
-        trusted_fake_dns = (
-            parsed.scheme == "https" and parsed.port in (None, 443)
-            and (
-                host == "aweme.snssdk.com"
-                or host.endswith(".douyinvod.com")
-                or host.endswith(".zjcdn.com")
-            )
-        )
-        fake_networks = (ipaddress.ip_network("198.18.0.0/15"), ipaddress.ip_network("2001:2::/48"))
-        addresses = {info[4][0] for info in socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)}
-        for address in addresses:
-            ip = ipaddress.ip_address(address)
-            if trusted_fake_dns and any(ip in network for network in fake_networks):
-                continue
-            if any((ip.is_private, ip.is_loopback, ip.is_link_local, ip.is_reserved, ip.is_multicast, ip.is_unspecified)):
-                return False
-        return bool(addresses)
-    except (OSError, ValueError):
-        return False
+
+class DownloadJobRequest(BaseModel):
+    mode: Literal["zip", "mux", "concat", "hls"]
+    url: str = Field("", max_length=8192)
+    audio_url: str = Field("", max_length=8192)
+    urls: list[str] = Field(default_factory=list, max_length=100)
+    filename: str = Field("media", max_length=180)
+
+    class Config:
+        extra = "forbid"
+
+
+def _download_error(error):
+    return JSONResponse(status_code=error.code, content={"code": error.code, "msg": str(error), "data": None})
+
+
+@app.post("/api/download/jobs")
+async def start_download_job(payload: DownloadJobRequest):
+    try:
+        data = payload.model_dump() if hasattr(payload, "model_dump") else payload.dict()
+        return {"code": 200, "data": create_download_job(data)}
+    except MediaError as exc:
+        return _download_error(exc)
+
+
+@app.get("/api/download/jobs/{job_id}")
+async def get_download_job(job_id: str):
+    try:
+        return {"code": 200, "data": download_job_status(job_id)}
+    except MediaError as exc:
+        return _download_error(exc)
+
+
+@app.delete("/api/download/jobs/{job_id}")
+async def stop_download_job(job_id: str):
+    try:
+        return {"code": 200, "data": await cancel_download_job(job_id)}
+    except MediaError as exc:
+        return _download_error(exc)
+
+
+@app.get("/api/download/jobs/{job_id}/file")
+async def get_download_job_file(job_id: str):
+    try:
+        status = download_job_status(job_id)
+        if status["status"] != "completed":
+            raise MediaError("文件尚未准备好", 409)
+        job = DOWNLOAD_JOBS[job_id]
+        return FileResponse(job["output"], filename=job["filename"], media_type="application/zip" if job["output"].suffix == ".zip" else "video/mp4", headers={"Cache-Control": "no-store"})
+    except MediaError as exc:
+        return _download_error(exc)
+
+
+@app.on_event("shutdown")
+async def close_download_jobs():
+    for job_id in list(DOWNLOAD_JOBS):
+        await cancel_download_job(job_id)
+        remove_download_job(job_id)
 
 
 @app.get("/api/download")
-async def proxy_download(url: str = Query(..., description="视频/音频直链"), filename: str = Query("video.mp4", description="下载文件名")):
-    """代理下载 - 流式转发，解决CDN防盗链"""
-    if not _is_safe_download_url(url):
-        return {"code": 400, "msg": "仅支持指向公网的 HTTP(S) 下载链接"}
-
-    headers = {
-        "User-Agent": USER_AGENT,
-        "Referer": "https://www.douyin.com/",
-        "Accept": "*/*",
-    }
-    client = httpx.AsyncClient(follow_redirects=False, timeout=httpx.Timeout(10, read=300))
-    resp = None
-    current_url = url
+async def proxy_download(url: str = Query(..., description="媒体直链"), filename: str = Query("video.mp4", description="下载文件名"), request: Request = None):
+    """平台 Referer、Range、完整性与公网跳转校验。"""
     try:
-        for _ in range(5):
-            req = client.build_request("GET", current_url, headers=headers)
-            resp = await client.send(req, stream=True)
-            if resp.status_code not in (301, 302, 303, 307, 308):
-                break
-            location = resp.headers.get("location")
-            await resp.aclose()
-            if not location:
-                break
-            current_url = urllib.parse.urljoin(current_url, location)
-            if not _is_safe_download_url(current_url):
-                await client.aclose()
-                return {"code": 400, "msg": "下载链接重定向到不允许的地址"}
-        if resp is None:
-            await client.aclose()
-            return {"code": 502, "msg": "下载请求失败"}
+        return await download_response(url, filename, request.headers.get("range") if request else None)
+    except MediaError as exc:
+        return {"code": exc.code, "msg": str(exc)}
     except httpx.HTTPError:
-        if resp is not None:
-            await resp.aclose()
-        await client.aclose()
-        return {"code": 502, "msg": "下载请求失败"}
-
-    if resp.status_code != 200:
-        await resp.aclose()
-        await client.aclose()
-        return {"code": resp.status_code, "msg": "下载失败，链接可能已过期"}
-
-    content_type = resp.headers.get("content-type", "video/mp4")
-    content_length = resp.headers.get("content-length", "")
-
-    safe_filename = re.sub(r'[\r\n\\/:*?"<>|]+', "_", filename).strip()[:200] or "video.mp4"
-    encoded_filename = urllib.parse.quote(safe_filename, safe="")
-    resp_headers = {
-        "Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}",
-    }
-    if content_length:
-        resp_headers["Content-Length"] = content_length
-
-    async def stream_body():
-        try:
-            async for chunk in resp.aiter_bytes(chunk_size=65536):
-                yield chunk
-        finally:
-            await resp.aclose()
-            await client.aclose()
-
-    return StreamingResponse(stream_body(), media_type=content_type, headers=resp_headers)
+        return {"code": 502, "msg": "媒体下载请求失败"}
 
 
 @app.get("/", response_class=HTMLResponse)

@@ -1,64 +1,64 @@
 # Douyin API
 
-一个基于 FastAPI 的短视频链接解析服务，支持抖音、小红书、快手等平台，并提供流式下载代理。
+基于 FastAPI 的视频、图集与实况资源解析服务，提供原生平台解析、统一媒体数据和流式下载。
 
-## 特性
+## 功能
 
-- 抖音多策略解析：免 Cookie 详情优先，签名 API、Playwright 浏览器和公开 API 兜底
-- 抖音原画入口与 CDN 探测、全部转码画质及备用链接、可选播放量
-- 网页按画质分别下载，展示分辨率、帧率、编码、码率和文件大小
-- 小红书和快手原生页面/API 提取
-- 图集、视频元数据和无水印直链统一返回
-- 下载代理带公网地址校验，避免把服务变成 SSRF 入口
-- Cookie 通过环境变量或本地缓存配置，不进入版本库
-- 自动生成 OpenAPI 文档：`/docs`
+- 抖音原画探测、全部转码画质、实况图片/视频配对及作品统计。
+- 小红书多编码画质与实况整理，快手原生响应及页面数据提取。
+- 哔哩哔哩完整流、DASH 音轨、分 P 选择与多段资源处理。
+- 备用接口按平台路由，统一时长、文件大小、作者、画质和错误结果。
+- 下载支持平台 Referer、Range / 206、完整性检查、真实进度和取消。
+- 图集 ZIP、音视频合并、多段拼接和未加密点播 HLS 合并。
+- 服务器端媒体地址、跳转和资源上限校验；运行数据不进入版本库。
 
-## 快速开始
+## 本地运行
 
-需要 Python 3.9 或更高版本。
+需要 Python 3.9+。
 
 ```bash
 python -m venv .venv
-# Windows: .venv\\Scripts\\activate
+# Windows: .venv\Scripts\activate
 # Linux/macOS: source .venv/bin/activate
 pip install -r requirements.txt
 playwright install chromium
 python server.py
 ```
 
-打开 <http://localhost:8848>，或访问 <http://localhost:8848/docs> 查看 API。
+页面：<http://localhost:8848>。接口说明：<http://localhost:8848/docs>。
 
-如需配置 Cookie，复制 `.env.example` 为 `.env` 并填写 `DOUYIN_COOKIE`。服务会自动读取该文件；也可以直接设置同名环境变量。服务还会在首次请求时尝试通过 Playwright 自动获取短期 Cookie。
+可选运行参数使用 `.env.example` 作为模板，本地填写后保存为 `.env`。不要提交实际会话、运行配置或下载文件。
 
-## API 示例
+音视频与 HLS 合并使用运行依赖提供的本地媒体处理程序；也可由 `FFMPEG_PATH` 指定可执行文件。当前下载任务状态位于进程内，部署时使用单 worker。
 
-```bash
-curl "http://localhost:8848/api/parse?url=https://v.douyin.com/example/"
-curl "http://localhost:8848/api/status"
-```
-
-`/api/test` 和 `/api/debug` 默认关闭。仅在本地排障时设置 `ENABLE_DEBUG_ENDPOINTS=1`。
-
-## 项目结构
+## 接口
 
 ```text
-.
-├── server.py              # FastAPI 应用和路由
-├── douyin_parser.py       # 抖音详情、转码画质及精选页播放量格式化
-├── platform_parsers.py    # 小红书、快手解析器
-├── browser_parser.py      # Playwright 浏览器解析器
-├── cookie_manager.py      # Cookie 获取和缓存
-├── abogus.py / xbogus.py  # 抖音签名算法
-├── index.html             # 内置 Web 界面
-├── tests/                 # 自动化测试
-├── requirements.txt       # 运行依赖
-└── docs/                  # 使用和部署文档
+GET    /api/parse?url=<分享链接>
+GET    /api/download?url=<媒体链接>&filename=<文件名>
+POST   /api/download/jobs
+GET    /api/download/jobs/{id}
+DELETE /api/download/jobs/{id}
+GET    /api/download/jobs/{id}/file
+GET    /api/status
 ```
 
-更多说明见 [docs/使用说明.md](docs/使用说明.md) 和 [docs/部署指南.md](docs/部署指南.md)。
-抖音接口依据、字段含义与核验结果见 [docs/抖音解析接口.md](docs/抖音解析接口.md)。
+`/api/test` 和 `/api/debug` 默认关闭，只用于本地开发排查。
 
-## 测试
+## 模块
+
+| 文件 | 职责 |
+|---|---|
+| `server.py` | 请求入口、策略调度、下载任务接口 |
+| `douyin_parser.py` | 抖音媒体、画质、实况及统计数据 |
+| `bilibili_parser.py` | 哔哩哔哩作品、分 P、视频与音轨 |
+| `platform_parsers.py` | 小红书、快手原生解析 |
+| `public_api.py` / `media_normalizer.py` | 备用路由与统一字段适配 |
+| `media_downloads.py` | 流式下载、校验、任务、打包与合并 |
+| `cookie_manager.py` / `browser_parser.py` | 本地会话与浏览器备用策略 |
+| `index.html` | 资源选择、下载进度、取消和结果展示 |
+
+## 开发测试
 
 ```bash
 pip install -r requirements-dev.txt
@@ -66,12 +66,10 @@ playwright install chromium
 python -m pytest -q
 ```
 
-测试包含实际 Chromium 页面交互；Linux CI 会同时安装浏览器所需的系统依赖。
+测试包括原生响应、接口适配、下载任务、真实小型媒体合并和 Chromium 交互。Linux 环境安装浏览器时可使用 `playwright install --with-deps chromium`。
 
-## 免责声明
-
-请遵守各平台服务条款、版权和隐私法规。仅对你有权访问和下载的内容使用本项目。
+原理和测试记录见 [解析原理与开发测试](docs/解析原理与开发测试.md)，接口用法见 [使用说明](docs/使用说明.md)，运行说明见 [部署指南](docs/部署指南.md)。
 
 ## License
 
-Apache License 2.0。详见 [LICENSE](LICENSE)。
+Apache License 2.0。已有组件的许可证与署名保留在对应源码及 [NOTICE](NOTICE) 中。
