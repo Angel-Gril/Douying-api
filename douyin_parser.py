@@ -6,6 +6,15 @@ from typing import Optional
 from urllib.parse import urlencode
 
 
+def extract_aweme_id(url: str) -> Optional[str]:
+    """从作品路径或详情参数提取作品 ID，调用者负责校验平台主机。"""
+    for pattern in (r'/video/(\d+)', r'/note/(\d+)', r'modal_id=(\d+)', r'aweme_id=(\d+)', r'/(\d{15,})'):
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    return None
+
+
 def build_original_video_url(video_id: str) -> str:
     if not isinstance(video_id, str) or not video_id:
         return ""

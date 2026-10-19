@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json.schemastore.org/wrangler.json",
+  "name": "douying-api-test",
+  "main": ".build/entry.py",
+  "compatibility_date": "2026-10-19",
+  "compatibility_flags": ["python_workers", "disable_python_external_sdk"],
+  "workers_dev": true,
+  "build": {"command": "python build.py"},
+  "assets": {
+    "directory": ".build/public",
+    "binding": "ASSETS",
+    "run_worker_first": ["/api/*"]
+  },
+  "observability": {"enabled": false},
+  "vars": {
+    "CORS_ORIGINS": "https://angel-gril.github.io,http://localhost:8848,http://127.0.0.1:8848"
+  }
+}

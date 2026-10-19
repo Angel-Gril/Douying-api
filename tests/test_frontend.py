@@ -384,3 +384,86 @@ def test_only_real_numeric_statistics_and_millisecond_duration_are_shown(video_p
     expect(page.locator(".work-metadata")).to_contain_text("点赞 12")
     expect(page.locator(".work-metadata")).not_to_contain_text("评论")
     expect(page.locator(".work-metadata")).not_to_contain_text("分享")
+
+
+@pytest.fixture
+def pages_demo(browser, quality_response):
+    context = browser.new_context(viewport={"width": 390, "height": 1000}, accept_downloads=True)
+    page = context.new_page()
+    calls = []
+    html = (Path(__file__).resolve().parents[1] / "index.html").read_text(encoding="utf-8")
+
+    def handle(route):
+        url = urlparse(route.request.url)
+        calls.append((url.netloc, url.path))
+        headers = {"Access-Control-Allow-Origin": "https://demo.github.io"}
+        if url.netloc == "demo.github.io" and url.path == "/Douying-api/":
+            route.fulfill(status=200, content_type="text/html", body=html)
+        elif url.netloc == "api.demo.test" and url.path == "/api/status":
+            route.fulfill(status=200, content_type="application/json", body=json.dumps({"status": "running", "cookie_configured": False}), headers=headers)
+        elif url.netloc == "api.demo.test" and url.path == "/api/parse":
+            route.fulfill(status=200, content_type="application/json", body=json.dumps(quality_response), headers=headers)
+        elif url.netloc == "api.demo.test" and url.path == "/api/download":
+            route.fulfill(status=200, content_type="video/mp4", body=b"\x00\x00\x00\x18ftypmp42", headers=headers)
+        else:
+            route.fulfill(status=404, content_type="application/json", body="{}", headers=headers)
+
+    page.route("**/*", handle)
+    page.goto("https://demo.github.io/Douying-api/")
+    yield page, calls
+    context.close()
+
+
+def test_pages_requires_service_without_requesting_pages_api(pages_demo):
+    page, calls = pages_demo
+    expect(page.locator("#statusText")).to_have_text("请配置解析服务")
+    expect(page.locator("#parseBtn")).to_be_disabled()
+    expect(page.locator("#apiSettings")).to_have_attribute("open", "")
+    assert not any(path.startswith("/api/") for _, path in calls)
+
+
+def test_pages_service_routes_parse_download_and_restores_after_reload(pages_demo):
+    page, calls = pages_demo
+    page.locator("#apiEndpoint").fill("https://api.demo.test/")
+    page.locator("#connectApi").click()
+    expect(page.locator("#statusText")).to_have_text("服务运行中")
+    page.locator("#urlInput").fill("https://www.douyin.com/video/1234567890123456789")
+    page.locator("#parseBtn").click()
+    expect(page.locator("#resultBox")).to_contain_text("4K")
+    with page.expect_download():
+        page.get_by_role("button", name="下载 720p", exact=True).click()
+    assert ("api.demo.test", "/api/parse") in calls
+    assert ("api.demo.test", "/api/download") in calls
+    assert not any(host == "demo.github.io" and path.startswith("/api/") for host, path in calls)
+    page.reload()
+    expect(page.locator("#apiEndpoint")).to_have_value("https://api.demo.test")
+    expect(page.locator("#statusText")).to_have_text("服务运行中")
+    assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+    page.locator("#apiSettings summary").click()
+    page.locator("#resetApi").click()
+    expect(page.locator("#statusText")).to_have_text("请配置解析服务")
+
+
+@pytest.mark.parametrize("endpoint", ["javascript:alert(1)", "https://name:password@api.demo.test", "https://api.demo.test/api", "http://api.demo.test"])
+def test_pages_rejects_invalid_or_insecure_service_addresses(pages_demo, endpoint):
+    page, calls = pages_demo
+    page.locator("#apiEndpoint").fill(endpoint)
+    page.locator("#connectApi").click()
+    expect(page.locator("#apiFeedback")).to_have_attribute("role", "status")
+    expect(page.locator("#apiFeedback")).to_contain_text("服务地址")
+    expect(page.locator("#parseBtn")).to_be_disabled()
+    assert not any(host == "api.demo.test" for host, _ in calls)
+
+
+def test_pages_limited_service_does_not_offer_unavailable_jobs(pages_demo):
+    page, calls = pages_demo
+    page.route("https://api.demo.test/api/status", lambda route: route.fulfill(status=200, content_type="application/json", headers={"Access-Control-Allow-Origin": "https://demo.github.io"}, body=json.dumps({"status": "running", "supported_platforms": ["douyin"], "notice": "抖音直链测试服务", "download_features": {"zip": False, "merge": False, "hls": False}})))
+    page.route("https://api.demo.test/api/parse?**", lambda route: route.fulfill(status=200, content_type="application/json", headers={"Access-Control-Allow-Origin": "https://demo.github.io"}, body=json.dumps({"code": 200, "data": {"type": "live", "images": ["https://media.example/1.jpg", "https://media.example/2.jpg"]}})))
+    page.locator("#apiEndpoint").fill("https://api.demo.test")
+    page.locator("#connectApi").click()
+    expect(page.locator("#serviceNotice")).to_have_text("抖音直链测试服务")
+    expect(page.locator('[data-platform="bilibili"]')).to_be_hidden()
+    page.locator("#urlInput").fill("https://www.douyin.com/note/1234567890123456789")
+    page.locator("#parseBtn").click()
+    expect(page.get_by_role("button", name="下载 全部打包 ZIP", exact=True)).to_be_disabled()
+    assert not any(path.startswith("/api/download/jobs") for _, path in calls)

@@ -7,6 +7,12 @@ env/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.wrangler/
+cloudflare/.build/
+cloudflare/.dry-run/
+cloudflare/.venv-workers/
+_site/
+node_modules/
 *.egg-info/
 build/
 dist/

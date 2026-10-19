@@ -1,0 +1,44 @@
+name: Demo page
+
+on:
+  push:
+    branches: [main, feat/native-platform-parsers]
+    paths: [index.html, .github/workflows/pages.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/configure-pages@v5
+      - name: Prepare the static demo only
+        shell: python
+        run: |
+          from pathlib import Path
+          output = Path('_site')
+          output.mkdir()
+          source = Path('index.html').read_text(encoding='utf-8')
+          marker = '<meta name="parser-hosting" content="backend">'
+          assert marker in source
+          (output / 'index.html').write_text(source.replace(marker, '<meta name="parser-hosting" content="static">'), encoding='utf-8')
+          (output / '.nojekyll').touch()
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - name: Publish demo page
+        id: deployment
+        uses: actions/deploy-pages@v4

@@ -23,6 +23,13 @@ jobs:
           /usr/bin/ffmpeg -version
       - name: Compile Python modules
         run: python -m compileall -q .
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Validate Workers deployment package
+        env:
+          WRANGLER_SEND_METRICS: "false"
+        run: npx --yes wrangler@4.151.1 --cwd cloudflare deploy --dry-run --outdir .dry-run
       - name: Run tests
         env:
           FFMPEG_PATH: /usr/bin/ffmpeg

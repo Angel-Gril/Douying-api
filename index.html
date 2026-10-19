@@ -3,6 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="parser-hosting" content="backend">
     <title>短视频无水印解析</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -114,6 +115,12 @@
         .parts-controls select { flex: 1; min-width: 0; max-width: 100%; min-height: 44px; padding: 8px; border: 1px solid #454566; border-radius: 5px; background: #0a0a1a; color: #e0e0e0; }
         .save-preference { display: flex; align-items: center; gap: 7px; color: #a0a6bf; font-size: 12px; margin-bottom: 12px; }
         .save-preference input { accent-color: #788ef3; }
+        .service-settings { margin: 0 0 20px; padding: 14px 16px; border: 1px solid #2a2a4a; border-radius: 8px; background: #12122a; }
+        .service-settings summary { cursor: pointer; color: #c8cce8; font-size: 14px; }
+        .service-settings label { display: block; margin-top: 14px; font-size: 13px; }
+        .service-controls { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+        .service-controls input { flex-basis: 260px; }
+        .service-help { margin-top: 10px; color: #a0a6bf; font-size: 12px; line-height: 1.7; overflow-wrap: anywhere; }
         @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } }
         @media (max-width: 480px) {
             .container { padding: 24px 16px; }
@@ -126,18 +133,31 @@
 <body>
 <div class="container">
     <h1>短视频无水印解析</h1>
-    <p class="subtitle">本地自建服务 - 多策略解析，不依赖单一API</p>
+    <p class="subtitle">连接解析服务，查看原画与全部可用画质</p>
 
     <div class="status-bar">
         <span class="status-item"><span class="dot dot-green" id="dotServer"></span><span id="statusText">检测中...</span></span>
         <span class="status-item"><span class="dot" id="dotCookie"></span><span id="cookieText">Cookie: -</span></span>
     </div>
 
+    <details class="service-settings" id="apiSettings">
+        <summary>解析服务设置</summary>
+        <label for="apiEndpoint">解析服务地址</label>
+        <div class="service-controls">
+            <input type="text" id="apiEndpoint" placeholder="https://你的解析服务域名" autocomplete="url" spellcheck="false" aria-describedby="apiFeedback">
+            <button class="secondary-button" id="connectApi" onclick="connectApi()">连接并保存</button>
+            <button class="secondary-button" id="resetApi" onclick="resetApi()">使用本站服务</button>
+        </div>
+        <p class="service-help" id="apiFeedback" role="status" aria-live="polite"></p>
+        <p class="service-help">演示网页需要连接实际运行的解析服务。地址仅保存在当前浏览器中；填写服务根地址，无需添加 /api。</p>
+    </details>
+    <p class="service-help" id="serviceNotice" style="margin-bottom:16px;" hidden></p>
+
     <div class="platforms">
-        <span class="tag">抖音</span><span class="tag">豆包</span>
-        <span class="tag">快手</span><span class="tag">小红书</span>
-        <span class="tag">B站</span><span class="tag">微博</span>
-        <span class="tag">头条</span><span class="tag">皮皮虾</span>
+        <span class="tag" data-platform="douyin">抖音</span><span class="tag" data-platform="doubao">豆包</span>
+        <span class="tag" data-platform="kuaishou">快手</span><span class="tag" data-platform="xiaohongshu">小红书</span>
+        <span class="tag" data-platform="bilibili">B站</span><span class="tag" data-platform="weibo">微博</span>
+        <span class="tag" data-platform="toutiao">头条</span><span class="tag" data-platform="pipixia">皮皮虾</span>
     </div>
 
     <div class="input-row">
@@ -170,28 +190,154 @@
 </div>
 
 <script>
-const API_BASE = location.origin;
+const STATIC_DEMO = document.querySelector('meta[name="parser-hosting"]')?.content === 'static' || location.hostname.endsWith('.github.io') || location.protocol === 'file:';
+const DEFAULT_API_BASE = STATIC_DEMO ? '' : location.origin;
+const API_STORAGE_KEY = 'videoParser.apiOrigin';
+let API_BASE = DEFAULT_API_BASE;
+let parseController = null;
+let connectionVersion = 0;
+let serviceFeatures = null;
 const MEMORY_LIMIT = 256 * 1024 * 1024;
 const activeDownloads = new Map();
 
+function normalizeApiBase(value) {
+    let url;
+    try { url = new URL(value.trim()); }
+    catch { throw new Error('服务地址格式不正确，请填写完整的 HTTPS 地址。'); }
+    if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password || url.pathname !== '/' || url.search || url.hash) {
+        throw new Error('服务地址应为域名根地址，不包含账号、路径或查询参数。');
+    }
+    if (location.protocol === 'https:' && url.protocol !== 'https:') throw new Error('此演示页需要 HTTPS 服务地址。');
+    return url.origin;
+}
+
+try {
+    const saved = localStorage.getItem(API_STORAGE_KEY);
+    if (saved) API_BASE = normalizeApiBase(saved);
+} catch { /* 浏览器不允许存储或旧配置无效时使用当前默认值。 */ }
+
+function apiFeedback(message, error = false) {
+    const label = document.getElementById('apiFeedback');
+    label.textContent = message;
+    label.style.color = error ? '#fca5a5' : '';
+}
+
+function showServiceStatus(data) {
+    serviceFeatures = data.download_features || null;
+    const notice = document.getElementById('serviceNotice');
+    notice.textContent = data.notice || '';
+    notice.hidden = !notice.textContent;
+    document.querySelectorAll('[data-platform]').forEach(tag => {
+        tag.hidden = Array.isArray(data.supported_platforms) && !data.supported_platforms.includes(tag.dataset.platform);
+    });
+    document.getElementById('dotServer').className = 'dot dot-green';
+    document.getElementById('statusText').textContent = '服务运行中';
+    document.getElementById('dotCookie').className = `dot ${data.cookie_configured ? 'dot-green' : 'dot-yellow'}`;
+    document.getElementById('cookieText').textContent = data.cookie_configured ? 'Cookie: 已配置' : 'Cookie: 未配置';
+}
+
+async function readServiceStatus(base) {
+    const response = await fetch(`${base}/api/status`, {cache: 'no-store', signal: AbortSignal.timeout(10000)});
+    if (!response.ok) throw new Error('服务状态接口不可用');
+    const data = await response.json();
+    if (data.status !== 'running') throw new Error('此地址未返回解析服务状态');
+    return data;
+}
+
 async function checkStatus() {
+    const base = API_BASE;
+    document.getElementById('parseBtn').disabled = true;
+    if (!base) {
+        document.getElementById('dotServer').className = 'dot dot-yellow';
+        document.getElementById('statusText').textContent = '请配置解析服务';
+        document.getElementById('dotCookie').className = 'dot';
+        document.getElementById('cookieText').textContent = 'Cookie: -';
+        document.getElementById('apiSettings').open = true;
+        apiFeedback('填写实际运行的 HTTPS 解析服务地址，再连接服务。');
+        return;
+    }
     try {
-        const r = await fetch(`${API_BASE}/api/status`);
-        const d = await r.json();
-        document.getElementById('dotServer').className = 'dot dot-green';
-        document.getElementById('statusText').textContent = '服务运行中';
-        const hasCookie = d.cookie_configured;
-        document.getElementById('dotCookie').className = `dot ${hasCookie ? 'dot-green' : 'dot-yellow'}`;
-        document.getElementById('cookieText').textContent = hasCookie ? 'Cookie: 已配置' : 'Cookie: 未配置';
+        const data = await readServiceStatus(base);
+        if (API_BASE !== base) return;
+        showServiceStatus(data);
+        document.getElementById('parseBtn').disabled = false;
+        apiFeedback(`当前服务：${base}`);
     } catch {
+        if (API_BASE !== base) return;
         document.getElementById('dotServer').className = 'dot dot-red';
-        document.getElementById('statusText').textContent = '服务未启动';
+        document.getElementById('statusText').textContent = '服务连接失败';
         document.getElementById('dotCookie').className = 'dot dot-red';
         document.getElementById('cookieText').textContent = 'Cookie: -';
+        document.getElementById('apiSettings').open = true;
+        apiFeedback('连接失败，请检查服务地址、HTTPS 和服务端跨域设置。', true);
     }
 }
 
+function clearParsedResult() {
+    if (parseController) parseController.abort();
+    parseController = null;
+    const box = document.getElementById('resultBox');
+    box.className = 'result';
+    box.innerHTML = '';
+    document.getElementById('parseBtn').disabled = !API_BASE;
+}
+
+async function connectApi() {
+    if (activeDownloads.size) return apiFeedback('请先取消当前下载，再切换服务地址。', true);
+    const attempt = ++connectionVersion;
+    const button = document.getElementById('connectApi');
+    try {
+        const base = normalizeApiBase(document.getElementById('apiEndpoint').value);
+        button.disabled = true;
+        apiFeedback('正在连接解析服务…');
+        const data = await readServiceStatus(base);
+        if (attempt !== connectionVersion) return;
+        if (activeDownloads.size) throw new Error('请先取消当前下载，再切换服务地址。');
+        API_BASE = base;
+        try { localStorage.setItem(API_STORAGE_KEY, base); } catch { /* 本次连接仍可使用。 */ }
+        document.getElementById('apiEndpoint').value = base;
+        clearParsedResult();
+        showServiceStatus(data);
+        apiFeedback(`已连接：${base}`);
+    } catch (error) {
+        if (attempt === connectionVersion) apiFeedback(error.message.startsWith('服务地址') || error.message.includes('服务地址') ? error.message : '连接失败，请检查服务地址、HTTPS 和服务端跨域设置。', true);
+    } finally {
+        if (attempt === connectionVersion) button.disabled = false;
+    }
+}
+
+function resetApi() {
+    if (activeDownloads.size) return apiFeedback('请先取消当前下载，再切换服务地址。', true);
+    connectionVersion++;
+    document.getElementById('connectApi').disabled = false;
+    try { localStorage.removeItem(API_STORAGE_KEY); } catch { /* 无存储权限时只清除本次配置。 */ }
+    API_BASE = DEFAULT_API_BASE;
+    serviceFeatures = null;
+    document.getElementById('serviceNotice').hidden = true;
+    document.querySelectorAll('[data-platform]').forEach(tag => { tag.hidden = false; });
+    document.getElementById('apiEndpoint').value = API_BASE;
+    clearParsedResult();
+    checkStatus();
+}
+
+function initializeServiceSettings() {
+    document.getElementById('apiEndpoint').value = API_BASE;
+    document.getElementById('resetApi').textContent = STATIC_DEMO ? '清除地址' : '使用本站服务';
+    document.getElementById('apiEndpoint').addEventListener('keydown', event => {
+        if (event.key === 'Enter') {
+            event.preventDefault();
+            connectApi();
+        }
+    });
+    checkStatus();
+}
+
 async function parse(selectedUrl) {
+    if (!API_BASE) {
+        document.getElementById('apiSettings').open = true;
+        document.getElementById('apiEndpoint').focus();
+        return;
+    }
     const input = typeof selectedUrl === 'string' ? selectedUrl : document.getElementById('urlInput').value.trim();
     if (!input) return alert('请输入链接');
     for (const state of activeDownloads.values()) cancelDownload(state.button);
@@ -202,10 +348,14 @@ async function parse(selectedUrl) {
     box.className = 'result show';
     box.innerHTML = '<div class="loading"><div class="spinner"></div><p style="margin-top:10px">解析中...</p></div>';
     btn.disabled = true;
+    if (parseController) parseController.abort();
+    const controller = new AbortController();
+    parseController = controller;
 
     try {
-        const r = await fetch(`${API_BASE}/api/parse?url=${encodeURIComponent(input)}`);
+        const r = await fetch(`${API_BASE}/api/parse?url=${encodeURIComponent(input)}`, {signal: controller.signal});
         const d = await r.json();
+        if (parseController !== controller) return;
         if (d.code === 200 && d.data) {
             box.innerHTML = renderResult(d);
         } else {
@@ -215,11 +365,15 @@ async function parse(selectedUrl) {
             </div>`;
         }
     } catch (e) {
+        if (e.name === 'AbortError' || parseController !== controller) return;
         box.innerHTML = `<div style="color:#f87171;text-align:center;padding:20px;">
-            请求失败: ${esc(e.message)}<br><small style="color:#666;">请确认服务已启动: python server.py</small>
+            请求失败: ${esc(e.message)}<br><small style="color:#a0a6bf;">请检查解析服务连接和跨域设置。</small>
         </div>`;
     } finally {
-        btn.disabled = false;
+        if (parseController === controller) {
+            parseController = null;
+            btn.disabled = !API_BASE;
+        }
     }
 }
 
@@ -437,10 +591,13 @@ function dlItem(label, url, ext = 'mp4', metadata = '', filename, resource = {})
     if (spec.mode && spec.mode !== 'zip') ext = 'mp4';
     const safeName = String(filename || label).replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').replace(/[. ]+$/g, '').slice(0, 160) || '媒体';
     spec.filename = safeName + '.' + ext;
+    const feature = spec.mode === 'zip' ? 'zip' : spec.mode === 'hls' ? 'hls' : spec.mode ? 'merge' : null;
+    const unsupported = feature && serviceFeatures?.[feature] === false;
+    if (unsupported) metadata = [metadata, '当前服务暂不支持此操作，可分别下载原始资源'].filter(Boolean).join(' · ');
     const proxyUrl = downloadProxy(spec);
     return `<div class="download-item">
         <div class="download-info"><div class="download-label">${esc(label)}</div>${metadata ? `<div class="download-meta">${esc(metadata)}</div>` : ''}</div>
-        <div class="download-actions"><button class="download-button" aria-label="下载 ${esc(label)}" data-url="${esc(proxyUrl)}" data-resource="${esc(JSON.stringify(spec))}" onclick="startDownload(this)">下载</button>
+        <div class="download-actions"><button class="download-button" aria-label="下载 ${esc(label)}" data-url="${esc(proxyUrl)}" data-resource="${esc(JSON.stringify(spec))}" onclick="startDownload(this)" ${unsupported ? 'disabled title="当前服务暂不支持此操作"' : ''}>下载</button>
         <button class="secondary-button cancel-download" aria-label="取消下载" onclick="cancelDownload(this)" hidden>取消</button></div>
         <div class="download-feedback" hidden><div class="download-status" role="status" aria-live="polite"></div>
         <progress class="download-progress" max="100" aria-label="下载进度" hidden></progress>
@@ -695,7 +852,7 @@ function esc(s) {
 }
 
 document.getElementById('urlInput').addEventListener('keydown', e => { if (e.key === 'Enter') parse(); });
-checkStatus();
+initializeServiceSettings();
 </script>
 </body>
 </html>

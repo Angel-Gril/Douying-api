@@ -35,7 +35,7 @@ from media_downloads import create_download_job, download_job_status, cancel_dow
 from bilibili_parser import parse_bilibili
 from public_api import parse_public_url, LEGACY_PATHS
 from douyin_parser import (
-    build_original_video_url, extract_play_count, parse_aweme_detail, parse_iesdouyin_item,
+    build_original_video_url, extract_aweme_id, extract_play_count, parse_aweme_detail, parse_iesdouyin_item,
 )
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
@@ -209,22 +209,6 @@ async def resolve_short_url(url: str) -> str:
         except httpx.HTTPError:
             pass
     return original
-
-
-def extract_aweme_id(url: str) -> Optional[str]:
-    """从URL中提取视频ID"""
-    patterns = [
-        r'/video/(\d+)',
-        r'/note/(\d+)',
-        r'modal_id=(\d+)',
-        r'aweme_id=(\d+)',
-        r'/(\d{15,})',
-    ]
-    for p in patterns:
-        m = re.search(p, url)
-        if m:
-            return m.group(1)
-    return None
 
 
 # === 解析策略 ===
