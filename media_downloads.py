@@ -100,7 +100,7 @@ def _range_valid(value):
     return not (start and end) or int(start) <= int(end)
 
 
-async def open_media(url, range_header=None, allow_playlist=False):
+async def open_media(url, range_header=None, allow_playlist=False, if_range=None):
     if range_header and not _range_valid(range_header):
         raise MediaError("不支持的 Range 请求", 416)
     client = httpx.AsyncClient(follow_redirects=False, timeout=httpx.Timeout(10, read=300))
@@ -113,6 +113,8 @@ async def open_media(url, range_header=None, allow_playlist=False):
             headers = media_headers(current)
             if range_header:
                 headers["Range"] = range_header
+                if if_range:
+                    headers["If-Range"] = if_range
             response = await client.send(client.build_request("GET", current, headers=headers), stream=True)
             if response.status_code not in (301, 302, 303, 307, 308):
                 break

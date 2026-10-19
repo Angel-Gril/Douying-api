@@ -8,6 +8,7 @@ from urllib.parse import parse_qs, quote, urlencode, urljoin, urlsplit
 from workers import WorkerEntrypoint, Response, fetch
 
 from douyin_parser import build_original_video_url, extract_aweme_id, parse_aweme_detail
+from original_metadata import MetadataError, apply_original_metadata, media_identity, probe_metadata, validate_range_headers
 
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -27,7 +28,7 @@ def allowed_url(value, *, media=False):
         host = url.hostname or ""
         domains = MEDIA_DOMAINS if media else SHARE_DOMAINS
         valid_host = any(host == domain or host.endswith("." + domain) for domain in domains)
-        if media and host == "aweme.snssdk.com":
+        if media and host in {"aweme.snssdk.com", "www.douyin.com"}:
             valid_host = True
         return (url.scheme == "https" and url.port in (None, 443) and not url.username
                 and not url.password and valid_host)
@@ -35,21 +36,23 @@ def allowed_url(value, *, media=False):
         return False
 
 
-async def request_upstream(url, *, method="GET", range_header=None):
+async def request_upstream(url, *, method="GET", range_header=None, if_range=None):
     headers = {"User-Agent": USER_AGENT, "Referer": "https://www.douyin.com/", "Accept": "*/*", "Accept-Encoding": "identity"}
     if range_header:
         headers["Range"] = range_header
+        if if_range:
+            headers["If-Range"] = if_range
     try:
         return await asyncio.wait_for(fetch(url, method=method, headers=headers, redirect="manual"), timeout=8)
     except Exception:
         raise EdgeError("上游请求失败，请稍后重新解析") from None
 
 
-async def follow_media(url, *, method="GET", range_header=None):
+async def follow_media(url, *, method="GET", range_header=None, if_range=None):
     for _ in range(5):
         if not allowed_url(url, media=True):
             raise EdgeError("仅支持已验证的平台 HTTPS 媒体地址", 400)
-        response = await request_upstream(url, method=method, range_header=range_header)
+        response = await request_upstream(url, method=method, range_header=range_header, if_range=if_range)
         if response.status not in (301, 302, 303, 307, 308):
             return url, response
         location = response.headers.get("location")
@@ -57,6 +60,51 @@ async def follow_media(url, *, method="GET", range_header=None):
             raise EdgeError("媒体跳转缺少目标地址")
         url = urljoin(url, location)
     raise EdgeError("媒体跳转次数超过上限")
+
+
+async def original_video_metadata(url, file_size, validator=None):
+    """小窗口和表项预算，避免在免费运行时遍历长视频的逐帧大小表。"""
+    identity = validator
+
+    async def read_range(start, end):
+        nonlocal identity
+        _, response = await follow_media(url, range_header=f"bytes={start}-{end}", if_range=identity[1] if identity else None)
+        body, reader = response.js_object.body, None
+        try:
+            validate_range_headers(response.status, response.headers, start, end, file_size)
+            marker = media_identity(response.headers)
+            if identity and response.headers.get(identity[0]) not in (None, identity[1]):
+                raise MetadataError("media changed during metadata reads")
+            if not identity and marker:
+                identity = marker
+            if body is None:
+                raise MetadataError("empty metadata body")
+            reader = body.getReader()
+            content = bytearray()
+            while True:
+                item = await reader.read()
+                if item.done:
+                    break
+                chunk = item.value.to_py()
+                if len(content) + len(chunk) > end - start + 1:
+                    raise MetadataError("metadata response exceeds requested range")
+                content.extend(chunk)
+            return bytes(content)
+        finally:
+            if reader is not None:
+                try:
+                    await reader.cancel()
+                finally:
+                    reader.releaseLock()
+            elif body is not None:
+                await body.cancel()
+
+    try:
+        return await asyncio.wait_for(probe_metadata(read_range, file_size, cache_key=(url, validator),
+            window_size=32768, max_requests=3, max_bytes=524288, max_moov_bytes=262144,
+            max_timing_entries=256, max_sample_entries=0, max_boxes=256), timeout=4)
+    except Exception:
+        return {}
 
 
 async def parse_share(value):
@@ -108,7 +156,9 @@ async def parse_share(value):
                     content_type = (probe.headers.get("content-type") or "").split(";", 1)[0]
                     length = probe.headers.get("content-length") or "0"
                     if probe.status in (200, 206) and (content_type.startswith("video/") or content_type == "application/octet-stream") and length.isdecimal() and int(length) > 0:
-                        result.update(url=target, data_size=int(length), quality="original", width=0, height=0, bitrate=0, fps=0)
+                        result.update(url=target, data_size=int(length))
+                        metadata = await original_video_metadata(target, int(length), media_identity(probe.headers))
+                        apply_original_metadata(result, metadata)
                     elif result.get("url") == original_url:
                         return None
                 except EdgeError:

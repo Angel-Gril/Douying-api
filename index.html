@@ -418,7 +418,7 @@ function renderResult(resp) {
         const videoTitle = rawTitle || '视频';
         html += `<h2 class="download-heading">视频下载</h2>`;
         if (mainUrl) {
-            const label = d.quality === 'original' ? '原画' : `默认画质 · ${qualityLabel(d)}`;
+            const label = d.quality === 'original' ? `原画${Number(d.width) > 0 && Number(d.height) > 0 ? ' · ' + qualityLabel(d) : ''}` : `默认画质 · ${qualityLabel(d)}`;
             html += dlItem(label, mainUrl, d.format || 'mp4', qualityDetails(d), `${videoTitle}_${label}`, {...d, url: mainUrl});
         }
         if (d.original_url && d.quality !== 'original') {
@@ -508,10 +508,13 @@ function qualityLabel(video) {
 function qualityDetails(video) {
     const parts = [];
     if (Number(video.width) > 0 && Number(video.height) > 0) parts.push(`${Number(video.width)}×${Number(video.height)}`);
-    if (Number(video.fps) > 0) parts.push(`${Number(video.fps)} fps`);
+    if ([90, 180, 270].includes(Number(video.rotation))) parts.push(`旋转 ${Number(video.rotation)}°`);
+    if (Number(video.fps) > 0) parts.push(`${video.fps_kind === 'average' ? '平均 ' : ''}${Number(video.fps)} fps`);
     if (video.codec) parts.push(({h264: 'H.264', h265: 'H.265'})[video.codec] || String(video.codec).toUpperCase());
     const bitrate = Number(video.bit_rate || video.bitrate);
-    if (bitrate > 0) parts.push(bitrate >= 1000000 ? `${(bitrate / 1000000).toFixed(2)} Mbps` : `${Math.round(bitrate / 1000)} kbps`);
+    const formatRate = value => value >= 1000000 ? `${(value / 1000000).toFixed(2)} Mbps` : `${Math.round(value / 1000)} kbps`;
+    if (bitrate > 0) parts.push(`${video.bitrate_kind === 'video_average' ? '视频平均 ' : ''}${formatRate(bitrate)}`);
+    else if (Number(video.overall_bitrate) > 0) parts.push(`整文件平均 ${formatRate(Number(video.overall_bitrate))}`);
     const size = Number(video.data_size);
     if (size > 0) {
         const unit = size >= 1000000000 ? 'GB' : size >= 1000000 ? 'MB' : size >= 1000 ? 'KB' : 'B';

@@ -5,7 +5,10 @@
   "compatibility_date": "2026-10-19",
   "compatibility_flags": ["python_workers", "disable_python_external_sdk"],
   "workers_dev": true,
-  "build": {"command": "python build.py"},
+  "build": {
+    "command": "python build.py",
+    "watch_dir": ["worker.py", "../douyin_parser.py", "../original_metadata.py", "../index.html"]
+  },
   "assets": {
     "directory": ".build/public",
     "binding": "ASSETS",

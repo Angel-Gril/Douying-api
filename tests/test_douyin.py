@@ -131,9 +131,16 @@ def upstream(monkeypatch, detail):
             assert request.url.params["ratio"] == "default"
             return httpx.Response(state["original_status"], headers={"location": "https://cdn.example/original.mp4"})
         if request.url.host == "cdn.example":
-            assert request.method == "HEAD"
             assert request.headers["referer"] == "https://www.douyin.com/"
-            return httpx.Response(200, headers={"content-type": state.get("media_type", "video/mp4"), "content-length": "3000000"})
+            content = state.get("original_bytes")
+            size = len(content) if content is not None else 3000000
+            if request.method == "HEAD":
+                return httpx.Response(200, headers={"content-type": state.get("media_type", "video/mp4"), "content-length": str(size)})
+            assert request.method == "GET"
+            if content is not None:
+                start, end = map(int, request.headers["range"][6:].split("-"))
+                return httpx.Response(206, content=content[start:end + 1], headers={"content-type": "video/mp4", "content-range": f"bytes {start}-{end}/{size}"})
+            return httpx.Response(200, headers={"content-type": "video/mp4", "content-length": str(size)})
         raise AssertionError(f"Unexpected upstream: {request.method} {request.url}")
 
     def get_count(_session, url, **kwargs):
@@ -196,6 +203,19 @@ async def test_original_failure_preserves_best_transcode_and_real_zero_count(ups
     assert result["quality"] == "normal_1080_1"
     assert result["data_size"] == 2000000
     assert result["play_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_original_metadata_comes_from_original_mp4_not_the_60fps_transcode(upstream):
+    from test_original_metadata import box, moov
+    upstream["original_bytes"] = box(b"ftyp", b"isom") + box(b"mdat", b"x" * 200000) + moov(codec=b"hvc1", scale=28000, entries=((196, 1000),), duration=7000)
+    payload = await request_parse(upstream)
+    result = payload["data"]
+    assert result["quality"] == "original"
+    assert (result["width"], result["height"], result["codec"], result["fps"]) == (2160, 3840, "h265", 28)
+    assert result["duration"] == 7000 and result["metadata_source"] == "mp4_moov"
+    assert result["video_backup"][0]["fps"] == 60
+    assert result["bitrate_kind"] == "video_average" and result["overall_bitrate"] > 0
 
 
 @pytest.mark.asyncio

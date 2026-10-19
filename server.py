@@ -34,6 +34,8 @@ from media_downloads import MediaError, download_response, is_safe_media_url
 from media_downloads import create_download_job, download_job_status, cancel_download_job, remove_download_job, DOWNLOAD_JOBS, ffmpeg_path
 from bilibili_parser import parse_bilibili
 from public_api import parse_public_url, LEGACY_PATHS
+from original_metadata import MetadataError, apply_original_metadata, media_identity, probe_metadata, validate_range_headers
+from media_downloads import open_media
 from douyin_parser import (
     build_original_video_url, extract_aweme_id, extract_play_count, parse_aweme_detail, parse_iesdouyin_item,
 )
@@ -129,7 +131,7 @@ async def probe_video_url(url: str) -> Optional[dict]:
                 size = int(resp.headers.get("content-length", "0"))
                 if size < 0 or resp.headers.get("content-length") == "0":
                     return None
-                return {"url": current, "data_size": size}
+                return {"url": current, "data_size": size, "_identity": media_identity(resp.headers)}
         return None
 
     try:
@@ -141,6 +143,36 @@ async def probe_video_url(url: str) -> Optional[dict]:
 async def resolve_video_redirect(url: str) -> Optional[str]:
     media = await probe_video_url(url)
     return media["url"] if media else None
+
+
+async def probe_original_video_metadata(url: str, file_size: int, validator=None) -> dict:
+    """原画自身的有界 Range 探测；失败不改变已有下载结果。"""
+    identity = validator
+
+    async def read_range(start, end):
+        nonlocal identity
+        client, response = await open_media(url, range_header=f"bytes={start}-{end}", if_range=identity[1] if identity else None)
+        try:
+            validate_range_headers(response.status_code, response.headers, start, end, file_size)
+            marker = media_identity(response.headers)
+            if identity and response.headers.get(identity[0]) not in (None, identity[1]):
+                raise MetadataError("media changed during metadata reads")
+            if not identity and marker:
+                identity = marker
+            content = bytearray()
+            async for chunk in response.aiter_bytes():
+                if len(content) + len(chunk) > end - start + 1:
+                    raise MetadataError("metadata response exceeds requested range")
+                content.extend(chunk)
+            return bytes(content)
+        finally:
+            await response.aclose()
+            await client.aclose()
+
+    try:
+        return await asyncio.wait_for(probe_metadata(read_range, file_size, cache_key=(url, validator)), timeout=5)
+    except Exception:
+        return {}
 
 
 async def fetch_douyin_play_count(aweme_id: str) -> Optional[int]:
@@ -180,10 +212,11 @@ async def enrich_douyin_video(result: dict, aweme_id: str) -> bool:
     if original_url:
         result["original_url"] = original_url
     if media:
+        identity = media.pop("_identity", None)
         result.update(media)
         if original_url:
-            # HEAD 没有宽高/码率，不能把转码档的参数冒充原画参数。
-            result.update(quality="original", width=0, height=0, bitrate=0, fps=0)
+            metadata = await probe_original_video_metadata(media["url"], media.get("data_size", 0), identity)
+            apply_original_metadata(result, metadata)
     if count is not None:
         result["play_count"] = count
     if original_url and result.get("url") == original_url and not media:

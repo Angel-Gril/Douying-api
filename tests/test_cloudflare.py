@@ -7,11 +7,36 @@ from pathlib import Path
 import pytest
 
 
+class Body:
+    def __init__(self, content):
+        self.content = content
+        self.cancelled = False
+
+    def getReader(self):
+        body = self
+        class Reader:
+            sent = False
+            async def read(self):
+                if self.sent:
+                    return types.SimpleNamespace(done=True)
+                self.sent = True
+                return types.SimpleNamespace(done=False, value=types.SimpleNamespace(to_py=lambda: memoryview(body.content)))
+            async def cancel(self):
+                body.cancelled = True
+            def releaseLock(self):
+                pass
+        return Reader()
+
+    async def cancel(self):
+        self.cancelled = True
+
+
 class Response:
     def __init__(self, body=None, status=200, headers=None, **kwargs):
-        self.body, self.status = body, status
+        self.body, self.status = body.content if isinstance(body, Body) else body, status
         self.headers = {key.lower(): value for key, value in (headers or {}).items()}
-        self.js_object = types.SimpleNamespace(body=body)
+        stream = body if isinstance(body, Body) else Body(body) if isinstance(body, bytes) else None
+        self.js_object = types.SimpleNamespace(body=stream)
 
     @classmethod
     def json(cls, body, **kwargs):
@@ -80,6 +105,8 @@ async def test_edge_reuses_native_detail_with_2k_4k_and_verified_original(edge, 
             assert kwargs["method"] == "HEAD"
             return Response(status=302, headers={"location": "https://video.douyinvod.com/original.mp4"})
         assert url == "https://video.douyinvod.com/original.mp4"
+        if kwargs.get("method") == "GET":
+            return Response(status=200, headers={"content-type": "video/mp4", "content-length": "5000000"})
         return Response(status=200, headers={"content-type": "video/mp4", "content-length": "5000000"})
 
     monkeypatch.setattr(module, "fetch", fetch)
@@ -90,6 +117,33 @@ async def test_edge_reuses_native_detail_with_2k_4k_and_verified_original(edge, 
     assert data["width"] == data["height"] == 0
     assert [(item["width"], item["height"]) for item in data["video_backup"]] == [(3840, 2160), (2560, 1440)]
     assert not any("Cookie" in options.get("headers", {}) for _, options in requests)
+
+
+@pytest.mark.asyncio
+async def test_edge_reads_original_metadata_through_bounded_sdk_streams(edge, monkeypatch):
+    from test_original_metadata import box, moov
+    module, worker = edge
+    content = box(b"ftyp", b"isom") + box(b"mdat", b"x" * 40000) + moov(scale=28000, entries=((196, 1000),), duration=7000)
+    bodies = []
+    async def fetch(url, **kwargs):
+        if "aweme/detail/" in url:
+            return Response({"status_code": 0, "aweme_detail": {"aweme_id": "7345492945006595379", "video": {"play_addr": {"uri": "meta-original"}}}})
+        if "aweme.snssdk.com" in url:
+            return Response(status=302, headers={"location": "https://video.douyinvod.com/meta-original.mp4"})
+        if kwargs.get("method") == "HEAD":
+            return Response(headers={"content-type": "video/mp4", "content-length": str(len(content))})
+        if bodies:
+            assert kwargs["headers"]["If-Range"] == '"sample-version"'
+        start, end = map(int, kwargs["headers"]["Range"][6:].split("-"))
+        response = Response(content[start:end + 1], status=206, headers={"content-range": f"bytes {start}-{end}/{len(content)}", "content-length": str(end - start + 1), "etag": '"sample-version"'})
+        bodies.append(response.js_object.body)
+        return response
+    monkeypatch.setattr(module, "fetch", fetch)
+    result = await call(worker, "/api/parse?url=https%3A%2F%2Fwww.douyin.com%2Fvideo%2F7345492945006595379")
+    data = result.body["data"]
+    assert (data["width"], data["height"], data["codec"], data["fps"]) == (2160, 3840, "h265", 28)
+    assert data["duration"] == 7000
+    assert len(bodies) == 2 and all(body.cancelled for body in bodies)
 
 
 @pytest.mark.asyncio
@@ -151,6 +205,21 @@ async def test_edge_proxy_rejects_html_and_does_not_follow_private_media_redirec
         result = await call(worker, "/api/download?url=https%3A%2F%2Fvideo.douyinvod.com%2Fvideo.mp4")
         assert result.status in {400, 502}
         assert len(requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_edge_media_follows_first_party_douyin_redirect_to_verified_cdn(edge, monkeypatch):
+    module, worker = edge
+    requests = []
+    async def fetch(url, **kwargs):
+        requests.append(url)
+        if url.startswith("https://www.douyin.com/"):
+            return Response(status=302, headers={"location": "https://video.douyinvod.com/redirected.mp4"})
+        return Response(b"part", headers={"content-type": "video/mp4", "content-length": "4"})
+    monkeypatch.setattr(module, "fetch", fetch)
+    result = await call(worker, "/api/download?url=https%3A%2F%2Fwww.douyin.com%2Faweme%2Fv1%2Fplay%2F%3Fvideo_id%3Dsample")
+    assert result.status == 200 and result.body == b"part"
+    assert len(requests) == 2
 
 
 @pytest.mark.asyncio

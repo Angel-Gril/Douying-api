@@ -467,3 +467,16 @@ def test_pages_limited_service_does_not_offer_unavailable_jobs(pages_demo):
     page.locator("#parseBtn").click()
     expect(page.get_by_role("button", name="下载 全部打包 ZIP", exact=True)).to_be_disabled()
     assert not any(path.startswith("/api/download/jobs") for _, path in calls)
+
+
+def test_original_metadata_displays_actual_4k_and_labels_average_values(video_page, quality_response):
+    response = copy.deepcopy(quality_response)
+    response["data"].update(width=2160, height=3840, codec="h265", fps=28, fps_kind="average", bitrate=0, bit_rate=0, overall_bitrate=23450000, metadata_source="mp4_moov")
+    page = video_page(response, width=390)
+    row = page.locator(".download-item").first
+    expect(row).to_contain_text("原画 · 4K (2160p)")
+    expect(row).to_contain_text("2160×3840")
+    expect(row).to_contain_text("H.265")
+    expect(row).to_contain_text("平均 28 fps")
+    expect(row).to_contain_text("整文件平均 23.45 Mbps")
+    assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
