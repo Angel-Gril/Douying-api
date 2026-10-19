@@ -16,7 +16,14 @@ jobs:
         run: pip install -r requirements-dev.txt
       - name: Install Chromium for UI tests
         run: playwright install --with-deps chromium
+      - name: Install system FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          /usr/bin/ffmpeg -version
       - name: Compile Python modules
         run: python -m compileall -q .
       - name: Run tests
+        env:
+          FFMPEG_PATH: /usr/bin/ffmpeg
         run: python -m pytest -q
